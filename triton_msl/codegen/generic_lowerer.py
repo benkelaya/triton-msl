@@ -3485,6 +3485,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             )
 
         ptr_info = self.env_is_ptr.get(ptr_id)
+        offsets_from_pointer_arith = ptr_info is not None
         if ptr_info:
             base_ptr, offsets = ptr_info
         else:
@@ -3532,12 +3533,24 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 guard = f"{lid} < {store_1d_guard}u"
             else:
                 # After a 2D reduce (axis=1), the result is per-row and the
-                # broadcast uses lid / N (blocked). Fix: use lid / N as the
-                # store index and select one thread per row block.
+                # broadcast uses lid / N (blocked), so ONE thread per row must
+                # be selected to store. That selection is the guard.
+                #
+                # The store INDEX is a separate question. When the pointer came
+                # from pointer arithmetic the lowerer has already built the real
+                # address expression -- for a kernel storing at
+                # `out + (pid * BLOCK + arange(BLOCK))` that expression carries
+                # the program's own offset. Overwriting it with `lid / N`
+                # discards that, and every threadgroup then writes the same
+                # slot: a grid of M programs leaves one row written and M-1
+                # rows untouched, with no error and no refusal. Only when there
+                # was no pointer arithmetic -- the offset having defaulted to
+                # `lid` -- must the index be derived from the thread id.
                 shape = self._effective_2d_shape
                 if shape and len(shape) >= 2 and store_1d_guard == shape[0] and shape[1] > 0:
                     N = shape[1]
-                    offsets = f"({lid} / {N}u)"
+                    if not offsets_from_pointer_arith:
+                        offsets = f"({lid} / {N}u)"
                     guard = f"{lid} % {N}u == 0u && {lid} / {N}u < {store_1d_guard}u"
                 else:
                     guard = f"{lid} < {store_1d_guard}u"
