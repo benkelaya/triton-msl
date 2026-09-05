@@ -13,40 +13,59 @@ Usage:
 
 from textwrap import dedent
 
-from torch._inductor.codegen.common import (
-    DeviceOpOverrides,
-    register_device_op_overrides,
-)
+# torch is NOT imported at module scope.
+#
+# `metal_libdevice` lives in this package, and the core compiler reaches it on
+# EVERY compilation: `MetalBackend.get_module_map()` does
+# `from triton_msl.inductor.metal_libdevice import metal_libdevice`, which
+# executes this `__init__` first. With the Inductor imports at module scope,
+# that pulled `torch._inductor` into every process that compiled a single
+# kernel — including processes using the backend directly, with no
+# `torch.compile` anywhere.
+#
+# `metal_libdevice` itself needs only `triton`. The Inductor integration is
+# opt-in behind `register_metal_triton_backend()`, so its imports belong
+# inside it. This keeps a backend usable without PyTorch present at all.
 
 _registered = False
 
 
-class MetalTritonDeviceOpOverrides(DeviceOpOverrides):
-    """Device op overrides for MPS when using TritonScheduling.
+def _build_device_op_overrides():
+    """The overrides class, built when Inductor is actually being registered.
 
-    Metal has no stream concept, so stream-related methods return no-ops.
-    Mirrors CpuDeviceOpOverrides for stream handling.
+    It subclasses a torch type, so it cannot exist at module scope without
+    importing torch. Built on demand instead.
     """
+    from torch._inductor.codegen.common import DeviceOpOverrides
 
-    def import_get_raw_stream_as(self, name: str) -> str:
-        return dedent(
-            """
-            def get_raw_stream(_):
-                return 0
-            """
-        )
+    class MetalTritonDeviceOpOverrides(DeviceOpOverrides):
+        """Device op overrides for MPS when using TritonScheduling.
 
-    def set_device(self, device_idx: int) -> str:
-        return "pass  # MPS single device"
+        Metal has no stream concept, so stream-related methods return no-ops.
+        Mirrors CpuDeviceOpOverrides for stream handling.
+        """
 
-    def synchronize(self) -> str:
-        return "pass  # MPS synchronize handled by Metal command buffer"
+        def import_get_raw_stream_as(self, name: str) -> str:
+            return dedent(
+                """
+                def get_raw_stream(_):
+                    return 0
+                """
+            )
 
-    def device_guard(self, device_idx: int) -> str:
-        return "torch._ops.contextlib.nullcontext()"
+        def set_device(self, device_idx: int) -> str:
+            return "pass  # MPS single device"
 
-    def cpp_kernel_type(self) -> str:
-        return "void*"
+        def synchronize(self) -> str:
+            return "pass  # MPS synchronize handled by Metal command buffer"
+
+        def device_guard(self, device_idx: int) -> str:
+            return "torch._ops.contextlib.nullcontext()"
+
+        def cpp_kernel_type(self) -> str:
+            return "void*"
+
+    return MetalTritonDeviceOpOverrides
 
 
 def register_metal_triton_backend():
@@ -130,7 +149,9 @@ def register_metal_triton_backend():
     from torch._inductor.codegen.common import _initialize_device_op_overrides
 
     _initialize_device_op_overrides()
-    register_device_op_overrides("mps", MetalTritonDeviceOpOverrides())
+    from torch._inductor.codegen.common import register_device_op_overrides
+
+    register_device_op_overrides("mps", _build_device_op_overrides()())
 
     # Patch MpsInterface with methods needed by TritonScheduling.
     # MPS is single-device, so exchange_device/set_device are no-ops.

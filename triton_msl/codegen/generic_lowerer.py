@@ -4738,7 +4738,17 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             "__nv_isnand": "isnan",
             "__nv_signbitf": "signbit",
             "__nv_signbitd": "signbit",
+            # MSL has no `nearbyint`. `rint` is the same operation — round to
+            # nearest, ties to even, honouring the current rounding mode —
+            # and is what MSL calls it. Without this the prefix-strip rule
+            # emits `nearbyint(x)` and the shader compiler rejects the whole
+            # kernel with "use of undeclared identifier".
+            "__nv_nearbyint": "rint",
+            "__nv_nearbyintf": "rint",
         }
+        # MSL has no `powi` either, and this one is not a rename: the integer
+        # exponent has to be widened, because MSL's `pow` takes two floats.
+        _NV_INT_EXPONENT_POW = ("__nv_powi", "__nv_powif")
         if safe_name in _NV_TO_MSL:
             safe_name = _NV_TO_MSL[safe_name]
         elif safe_name.startswith("__nv_"):
@@ -4750,6 +4760,9 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
 
         # Build argument list
         args = [self._lookup(oid) for oid in ssa.operand_ids]
+        if func_name in _NV_INT_EXPONENT_POW and len(args) == 2:
+            safe_name = "pow"
+            args = [args[0], f"static_cast<float>({args[1]})"]
         args_str = ", ".join(args)
 
         # Determine result type
@@ -7343,6 +7356,9 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         callee = ssa.attrs.get("callee", "unknown_fn")
         safe_callee = self._sanitize_func_name(callee)
         args = [self._lookup(oid) for oid in ssa.operand_ids]
+        if func_name in _NV_INT_EXPONENT_POW and len(args) == 2:
+            safe_name = "pow"
+            args = [args[0], f"static_cast<float>({args[1]})"]
         args_str = ", ".join(args)
 
         # Find the callee function definition to determine return types
