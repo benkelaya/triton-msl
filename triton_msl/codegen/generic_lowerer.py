@@ -5087,6 +5087,24 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # addptr (2-level).
             scal = op_by_id.get(splat_base.operand_ids[0])
             if scal is None or scal.op != "tt.addptr" or len(scal.operand_ids) < 2:
+                # 0-level: splat(PTR) with no addptr above it, which is what a
+                # tensor BROADCAST over batch and head produces — a [1, 1, M, N]
+                # mask, the commonest shape there is. Both scalar legs
+                # contributed nothing, so both strides are reported folded, as
+                # the 1-level case already reports the h leg.
+                base0 = arg_by_id.get(splat_base.operand_ids[0])
+                if base0 is not None and base0.is_ptr:
+                    strides = [C1, C1, row_stride, col_stride]
+                    if any(x is None for x in strides):
+                        return None
+                    if strides[2] == C1:
+                        from triton_msl.errors import MetalNonRecoverableError
+
+                        raise MetalNonRecoverableError(
+                            "FlashAttention row stride resolved to 1; expected "
+                            "head_dim — refusing rather than risk wrong addressing"
+                        )
+                    return base0.index, strides
                 return None
             outer_stride = _scalar_stride_from_muli(scal.operand_ids[1])
             inner_arg = arg_by_id.get(scal.operand_ids[0])
@@ -5176,6 +5194,72 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 break
             return None
 
+        def _scalar_arg_of(sid, _depth=0):
+            """The scalar ARG index `sid` reduces to, through splats and
+            layout ops, or None."""
+            if _depth > 16 or sid is None:
+                return None
+            if sid in arg_by_id and not arg_by_id[sid].is_ptr:
+                return arg_by_id[sid].index
+            op = op_by_id.get(sid)
+            if op is None:
+                return None
+            if op.op in ("tt.splat", "ttg.convert_layout", "tt.broadcast",
+                         "arith.extf", "arith.truncf", "arith.extsi",
+                         "arith.trunci"):
+                return _scalar_arg_of((op.operand_ids or [None])[0], _depth + 1)
+            return None
+
+        def _bound_scalar_of(addr_id):
+            """The scalar ARG index a load's mask compares its index against.
+
+            `tl.load(ptr, mask=<index expr> < <scalar>)` lowers to a load whose
+            mask operand is an `arith.cmpi`; one side reduces to a splat of a
+            kernel argument, which is the sequence length. Returns None when
+            the load has no mask or the comparison is against something that
+            is not a single scalar argument — the caller then refuses rather
+            than inventing a bound.
+            """
+            load_op = None
+            for cand in all_ops:
+                if cand.op == "tt.load" and cand.operand_ids \
+                        and cand.operand_ids[0] == addr_id:
+                    load_op = cand
+                    break
+            if load_op is None or len(load_op.operand_ids or ()) < 2:
+                return None
+
+            def _scalar_arg_under(sid, _depth=0):
+                if _depth > 16 or sid is None:
+                    return None
+                if sid in arg_by_id and not arg_by_id[sid].is_ptr:
+                    return arg_by_id[sid].index
+                op = op_by_id.get(sid)
+                if op is None:
+                    return None
+                if op.op in ("tt.splat", "ttg.convert_layout", "tt.broadcast",
+                             "arith.extsi", "arith.trunci"):
+                    return _scalar_arg_under((op.operand_ids or [None])[0],
+                                             _depth + 1)
+                return None
+
+            frontier, seen = [load_op.operand_ids[1]], set()
+            while frontier:
+                sid = frontier.pop()
+                if sid in seen or len(seen) > 128:
+                    continue
+                seen.add(sid)
+                op = op_by_id.get(sid)
+                if op is None:
+                    continue
+                if op.op == "arith.cmpi":
+                    for side in (op.operand_ids or ()):
+                        found = _scalar_arg_under(side)
+                        if found is not None:
+                            return found
+                frontier.extend(op.operand_ids or ())
+            return None
+
         # --- MLA (nope/rope) 3-dot case: re-identify roles + the rope QK dot ----
         # Triton fuses `dot_nope + dot_rope` into a dot CHAIN (rope's accumulator
         # operand == nope's result), so a real MLA attention has 3 dots: two chained
@@ -5199,51 +5283,60 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 _refuse("the MLA QK dot chain (rope must accumulate onto nope's result)")
             is_mla = True
 
-        # --- an additive MASK the templates cannot represent -----------------
+        # --- the additive BIAS operand ---------------------------------------
         #
-        # Both FA templates take `causal` as a BOOLEAN and no mask operand:
-        # they compute the mask from the tile coordinates. A kernel that adds
-        # a LOADED tensor to the QK scores — the standard way to express an
-        # arbitrary attention mask, an ALiBi bias, or a causal mask
-        # materialised by the caller — cannot be expressed by them, and
-        # emitting one anyway drops the mask silently. Non-causal attention
-        # returned for a causal request is a plausible-looking wrong answer,
-        # which is the exact failure this file refuses everywhere else.
+        # FlashAttention-2 takes an optional bias: a matrix added to the q.k^T
+        # scores before the online softmax. It is how everything other than
+        # plain causality is expressed — padding masks, arbitrary attention
+        # masks, ALiBi, and a causal mask the caller materialised so that
+        # every tensor reaching the dot arrives by a single load.
         #
-        # DECLINE rather than refuse: returning None hands the kernel to the
-        # generic lowering, which honours whatever the IR says. Refusing here
-        # would fail a kernel another path may well handle, and the FA
-        # template is an optimisation, not the only way to run attention.
-        def _reaches_a_load(sid, _depth=0):
-            """True when any tt.load is reachable backwards from `sid`.
-
-            Deliberately generic — every operand of every op, not the
-            curated chain `_load_addr_for_dot_operand` walks. A mask arrives
-            through broadcasts, expand_dims and dtype casts, and a guard that
-            missed one of those would let exactly the kernel it exists to
-            stop through to a template that drops its mask.
-            """
-            if _depth > 24 or sid is None:
-                return False
-            op = op_by_id.get(sid)
-            if op is None:
-                return False
-            if op.op == "tt.load":
-                return True
-            return any(_reaches_a_load(o, _depth + 1)
-                       for o in (op.operand_ids or ()))
-
-        #: Ops that pass a value through unchanged as far as this guard is
-        #: concerned. The scores reach the mask add through at least one of
-        #: them (`ttg.convert_layout`, measured), so a walk that stopped at
-        #: the dot's direct consumers sees nothing.
+        # The pattern is a value tracing back to a tt.load, added to the QK
+        # dot's result through any number of layout-only ops. The scores
+        # reach that add through ttg.convert_layout, so the walk has to go
+        # FORWARD through those ops; stopping at the dot's direct consumers
+        # finds nothing.
+        #
+        # Recognising it is not the same as being permissive: everything that
+        # is not exactly this still refuses. Two added tensors would need two
+        # operands; a bias whose address chain does not resolve would be a
+        # guessed stride; a bias sharing a base pointer with Q/K/V/Out is not
+        # a bias. Each is a refusal below.
         _TRANSPARENT = ("ttg.convert_layout", "tt.reshape", "tt.broadcast",
                         "tt.expand_dims", "arith.extf", "arith.truncf",
                         "ttg.local_load", "ttg.local_alloc")
 
-        def _adds_a_loaded_tensor_to(dot_id):
-            """True when a loaded tensor is added onto this dot's result."""
-            frontier, seen = [dot_id], set()
+        def _reaches_a_load(sid, _depth=0):
+            """The tt.load address reachable backwards from `sid`, or None.
+
+            Deliberately generic — every operand of every op — because a bias
+            arrives through broadcasts, expand_dims and dtype casts, and a
+            walk that missed one would decline a kernel this feature exists
+            to run.
+            """
+            if _depth > 24 or sid is None:
+                return None
+            op = op_by_id.get(sid)
+            if op is None:
+                return None
+            if op.op == "tt.load" and op.operand_ids:
+                return op.operand_ids[0]
+            for o in (op.operand_ids or ()):
+                found = _reaches_a_load(o, _depth + 1)
+                if found is not None:
+                    return found
+            return None
+
+        def _loaded_addends_of(dot_id, exclude_addrs=()):
+            """Addresses of loaded tensors added onto this dot's result.
+
+            The walk stops at the softmax. Past the exp the values are
+            probabilities, not scores, and an add there is a different
+            operation — the running sum, the log-sum-exp update — whose other
+            operand can legitimately trace back to Q's own load. Walking on
+            found Q and reported two biases.
+            """
+            found, frontier, seen = [], [dot_id], set()
             while frontier:
                 sid = frontier.pop()
                 if sid in seen or len(seen) > 512:
@@ -5252,17 +5345,19 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 for cand in all_ops:
                     if sid not in (cand.operand_ids or ()):
                         continue
+                    if _op_is_exp(cand.op) or "max" in (cand.op or ""):
+                        continue          # the scores end here
                     if cand.op in ("arith.addf", "arith.subf"):
                         for other in cand.operand_ids:
-                            if other != sid and _reaches_a_load(other):
-                                return True
+                            if other == sid:
+                                continue
+                            addr = _reaches_a_load(other)
+                            if addr is not None and addr not in exclude_addrs:
+                                found.append(addr)
                         frontier.append(cand.id)
                     elif cand.op in _TRANSPARENT:
                         frontier.append(cand.id)
-            return False
-
-        if _adds_a_loaded_tensor_to(dot_qk.id):
-            return None
+            return found
 
         # --- pointer roles + strides -----------------------------------------
         q_addr = _load_addr_for_dot_operand(dot_qk.operand_ids[0])
@@ -5374,7 +5469,26 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         h_arg = scalar_by_name.get("H")
         n_ctx_arg = scalar_by_name.get("N_CTX")
         if n_ctx_arg is None:
-            _refuse("the N_CTX scalar arg")
+            # Resolved STRUCTURALLY when the kernel does not use the tutorial's
+            # name. Every FA kernel guards its loads against the sequence
+            # length — `tl.load(k_ptrs + ..., mask=(start_n + offs_n) < seqlen_k)`
+            # — so the bound is the scalar argument the K load's mask compares
+            # against, whatever it is called. The reference implementation
+            # calls it `seqlen_k`, the tutorial `N_CTX`; matching on either
+            # name would be a list of spellings, and this reads the kernel
+            # instead.
+            n_ctx_idx = _bound_scalar_of(k_addr)
+            if n_ctx_idx is None:
+                _refuse("the sequence-length bound (no N_CTX argument, and the "
+                        "K load carries no bound this can read)")
+
+            class _Resolved:
+                __slots__ = ("index",)
+
+                def __init__(self, index):
+                    self.index = index
+
+            n_ctx_arg = _Resolved(n_ctx_idx)
         z_val = z_arg.index if z_arg is not None else C1
         h_val = h_arg.index if h_arg is not None else C1
 
@@ -5395,6 +5509,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # (q * qk_scale, qk_scale = 1/sqrt(head_dim)). Find the arith.mulf
         # feeding dot 0's A operand whose other input is an arith.constant.
         scale = None
+        scale_arg = None
         scale_id = _skip_layout(dot_qk.operand_ids[0])
         seen = set()
         while scale_id in op_by_id and scale_id not in seen:
@@ -5407,6 +5522,18 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                         v = sub.attrs.get("value")
                         if isinstance(v, (int, float)):
                             scale = float(v)
+                if scale is None:
+                    # A RUNTIME scale. The reference FlashAttention takes
+                    # `softmax_scale` as an argument rather than baking
+                    # 1/sqrt(head_dim), because a caller may pass its own
+                    # (sliding-window and logit-capped attentions do). It is
+                    # not less resolvable than a constant — it is a scalar
+                    # argument, and the template can read it from its buffer.
+                    for oid in op.operand_ids:
+                        found = _scalar_arg_of(oid)
+                        if found is not None:
+                            scale_arg = found
+                            break
                 break
             if op.operand_ids and op.op in (
                 "ttg.local_load",
@@ -5419,8 +5546,33 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 scale_id = op.operand_ids[0]
                 continue
             break
-        if scale is None:
-            _refuse("the softmax scale constant")
+        if scale is None and scale_arg is None:
+            _refuse("the softmax scale (neither a constant nor a scalar argument "
+                    "multiplied into Q before the dot)")
+
+        # The bias, resolved now that the four roles are known.
+        #
+        # It has to be after them: `_reaches_a_load` walks back through
+        # everything, so from the P@V accumulator it reaches Q's own load
+        # through the softmax and reports Q as a second "added tensor". A
+        # tensor whose base pointer is already Q, K, V or Out is not a bias
+        # by definition, and dropping those is what leaves exactly the real
+        # one. Anything still ambiguous after that refuses.
+        bias_idx, bias_strides = None, None
+        _candidates = []
+        for _addr in _loaded_addends_of(dot_qk.id):
+            _res = _extract_ptr_strides(_addr)
+            if _res is None:
+                _refuse("the bias pointer/stride chain")
+            if _res[0] in (q_idx, k_idx, v_idx, o_idx):
+                continue          # the kernel's own operands, not a bias
+            _candidates.append(_res)
+        _distinct = {c[0]: c for c in _candidates}
+        if len(_distinct) > 1:
+            _refuse(f"the bias operand ({len(_distinct)} distinct loaded "
+                    f"tensors are added to the scores; the templates carry one)")
+        if _distinct:
+            bias_idx, bias_strides = next(iter(_distinct.values()))
 
         # --- out_dtype: the output pointer's element type --------------------
         out_arg = arg_by_id.get(self.graph.args[o_idx].id)
@@ -5447,13 +5599,20 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             "head_dim": head_dim,
             "v_head_dim": v_head_dim,
             "causal": causal,
+            # Exactly one of these is set: a baked constant, or the index of
+            # the scalar argument carrying the scale at runtime.
             "scale": scale,
+            "scale_arg": scale_arg,
             "out_dtype": out_dtype,
             # MLA (nope/rope): the QK score is TWO chained dots over separate tensors.
             # is_mla=True carries the rope Q/K pointer roles + their strides so the
             # dispatch can concat [q_nope|q_rope] / [k_nope|k_rope] into contiguous
             # [.,head_dim] and run the (validated) asymmetric qk=head_dim / v=v_head_dim
             # kernel. False/absent for symmetric FA (all fields below are ignored).
+            # The additive bias, or None. `bias_strides` is [z, h, m, n] in
+            # the same form as the other four: arg indices, or "c1" folded.
+            "bias": bias_idx,
+            "bias_strides": bias_strides,
             "is_mla": is_mla,
             "q_rope": qr_idx,
             "k_rope": kr_idx,
