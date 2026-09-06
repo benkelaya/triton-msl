@@ -57,6 +57,53 @@ class _TemplateMixin:
     but never define new state — that belongs in ``GenericLowerer.__init__``.
     """
 
+    def _emit_tile_ids_from_source_grid(self, lines, n_expr):
+        """Emit `pid_m` / `pid_n`, using the grid convention THE KERNEL USES.
+
+        A matmul template replaces the kernel's body, and with it the meaning
+        of the launch grid. The kernel decides that meaning: one that reads
+        only `program_id(0)` is launched with a FLAT grid of
+        `cdiv(M,BM) * cdiv(N,BN)` programs and recovers its tile from that
+        single id (the usual `GROUP_M` swizzle). A template that reads
+        `pid3.y` regardless is asking for a grid nobody dispatched, and on a
+        flat launch `pid3.y` is 0 for every program — so every program
+        computes a first-column tile and the rest of the output is never
+        written.
+
+        That is not hypothetical: `BLOCK_M = BLOCK_N = 32` at M = N = 64
+        dispatches grid (4,1,1), and 32 of the 64 output columns came back
+        untouched — a full-shape, finite, plausible half-matmul.
+
+        Any bijection from the flat id to the tile grid gives the same C —
+        each program owns one tile and they do not interact — so the flat
+        decomposition below is used rather than reproducing the kernel's
+        swizzle, which only affects locality.
+        """
+        axes = {s.attrs.get("axis", 0) for s in self.graph.ops
+                if s.op == "tt.get_program_id"}
+        if axes - {0}:
+            # The kernel really does use a multi-axis grid; take it as given.
+            self._used_pid_axes = {0, 1}
+            lines.append("    uint3 pid3 [[threadgroup_position_in_grid]],")
+            return False
+        self._used_pid_axes = {0}
+        lines.append("    uint pid3 [[threadgroup_position_in_grid]],")
+        return True
+
+    # (the body definitions are emitted by _emit_tile_ids_body, after the
+    #  scalar arguments are read, because a flat grid needs N to split the id)
+
+    def _emit_tile_ids_body(self, lines, flat, n_expr, bn_expr):
+        """The pid_m / pid_n definitions matching the signature just emitted."""
+        if not flat:
+            lines.append("    uint pid_m = pid3.x;")
+            lines.append("    uint pid_n = pid3.y;")
+            return
+        lines.append(f"    uint _num_pid_n = ((uint)({n_expr}) + {bn_expr}u - 1u) / {bn_expr}u;")
+        lines.append("    uint pid_m = _num_pid_n ? (pid3 / _num_pid_n) : 0u;")
+        lines.append("    uint pid_n = _num_pid_n ? (pid3 % _num_pid_n) : 0u;")
+
+
     def _simdgroup_leading_dims_are_dense(self, info, descriptors):
         """True iff every operand's inferred ROW stride is a compile-time literal
         equal to the matrix dim the NON-K-loop simdgroup template hard-codes as that
@@ -230,19 +277,23 @@ class _TemplateMixin:
             self._used_pid_axes = {0, 1}
             # Metal requires all thread-index attributes to share a type; use
             # uint3 for both when multi-axis dispatch is in play.
-            lines.append("    uint3 pid3 [[threadgroup_position_in_grid]],")
+            _flat_grid = self._emit_tile_ids_from_source_grid(lines, None)
             lines.append("    uint3 _lid3 [[thread_position_in_threadgroup]]")
             lines.append(") {")
-            lines.append("    uint pid_m = pid3.x;")
-            lines.append("    uint pid_n = pid3.y;")
             lines.append("    uint lid = _lid3.x;")
         else:
+            _flat_grid = None
             lines.append("    uint pid [[threadgroup_position_in_grid]],")
             lines.append("    uint lid [[thread_position_in_threadgroup]]")
             lines.append(") {")
             lines.append("    uint pid_m = 0u, pid_n = 0u;")
         for arg in all_scalar_args:
             lines.append(f"    int {arg.name} = {arg.name}_buf[0];")
+        if _flat_grid is not None:
+            # After the scalar reads, because a flat grid needs N to split the
+            # id into tile coordinates.
+            self._emit_tile_ids_body(
+                lines, _flat_grid, "N" if has_N else str(BLOCK_N), BLOCK_N)
 
         lines.append(f"    uint _M = {'(uint)M' if has_M else f'{BLOCK_M}u'};")
         lines.append(f"    uint _N = {'(uint)N' if has_N else f'{BLOCK_N}u'};")
@@ -638,7 +689,7 @@ class _TemplateMixin:
             else:
                 arg_decls.append(f"    device int* {arg.name}_buf [[buffer({i})]]")
         lines.append(",\n".join(arg_decls) + ",")
-        lines.append(f"    uint3 pid3 [[threadgroup_position_in_grid]],")
+        _flat_grid = self._emit_tile_ids_from_source_grid(lines, None)
         lines.append(f"    uint sgitg [[simdgroup_index_in_threadgroup]],")
         lines.append(f"    uint tiitg [[thread_index_in_threadgroup]]")
         lines.append(f") {{")
@@ -648,8 +699,9 @@ class _TemplateMixin:
             lines.append(f"    int {arg.name} = {arg.name}_buf[0];")
 
         lines.append(f"")
-        lines.append(f"    uint pid_m = pid3.x;")
-        lines.append(f"    uint pid_n = pid3.y;")
+        self._emit_tile_ids_body(
+            lines, _flat_grid,
+            "N" if "N" in scalar_arg_map else str(BLOCK_N), BLOCK_N)
         lines.append(f"")
 
         # Determine M, N, K — use scalar args if available, else BLOCK dims
