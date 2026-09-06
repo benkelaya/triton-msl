@@ -5038,6 +5038,35 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # terminal: addptr(broadcast(row_ptr_2d), broadcast(col_term))
             if op is None or op.op != "tt.addptr" or len(op.operand_ids) < 2:
                 return None
+            # A pointer ADVANCED INSIDE THE LOOP sits one addptr above that
+            # terminal: `tl.load(k_ptrs + start_n * stride_kn)` is
+            # `addptr(addptr(broadcast(row_ptr_2d), col_term), advance)`,
+            # where Q — loaded once, before the loop — is the bare terminal.
+            #
+            # That asymmetry is how every FlashAttention kernel is written:
+            # Q is hoisted, K and V walk the sequence. Matching only the bare
+            # terminal therefore resolved Q and refused K, on kernels that
+            # are otherwise exactly the recognised pattern.
+            #
+            # The advance is DISCARDED rather than folded in, and that is
+            # correct here specifically: past this point the caller emits one
+            # of the FA templates, which regenerates the N loop from the
+            # base pointer and the strides resolved below. It never replays
+            # the IR's own induction, so the advance carries no information
+            # the template needs. (A general addptr lowering could not drop
+            # it — this peel lives in the FA path and nowhere else.)
+            #
+            # Peeling is bounded and conservative: it stops at the first
+            # level whose pointer operand is not itself an addptr, which is
+            # the terminal shape. A kernel already in that shape peels
+            # nothing.
+            for _ in range(8):
+                inner = op_by_id.get(_skip_layout(op.operand_ids[0]))
+                if inner is None or inner.op != "tt.addptr" or len(inner.operand_ids) < 2:
+                    break
+                op = inner
+            if op is None or op.op != "tt.addptr" or len(op.operand_ids) < 2:
+                return None
             col_stride = _stride_from_index_term(op.operand_ids[1])
             # row side: broadcast -> addptr(splat(scalar_base), row_term)
             row_side = _skip_layout(op.operand_ids[0])
@@ -5170,6 +5199,71 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 _refuse("the MLA QK dot chain (rope must accumulate onto nope's result)")
             is_mla = True
 
+        # --- an additive MASK the templates cannot represent -----------------
+        #
+        # Both FA templates take `causal` as a BOOLEAN and no mask operand:
+        # they compute the mask from the tile coordinates. A kernel that adds
+        # a LOADED tensor to the QK scores — the standard way to express an
+        # arbitrary attention mask, an ALiBi bias, or a causal mask
+        # materialised by the caller — cannot be expressed by them, and
+        # emitting one anyway drops the mask silently. Non-causal attention
+        # returned for a causal request is a plausible-looking wrong answer,
+        # which is the exact failure this file refuses everywhere else.
+        #
+        # DECLINE rather than refuse: returning None hands the kernel to the
+        # generic lowering, which honours whatever the IR says. Refusing here
+        # would fail a kernel another path may well handle, and the FA
+        # template is an optimisation, not the only way to run attention.
+        def _reaches_a_load(sid, _depth=0):
+            """True when any tt.load is reachable backwards from `sid`.
+
+            Deliberately generic — every operand of every op, not the
+            curated chain `_load_addr_for_dot_operand` walks. A mask arrives
+            through broadcasts, expand_dims and dtype casts, and a guard that
+            missed one of those would let exactly the kernel it exists to
+            stop through to a template that drops its mask.
+            """
+            if _depth > 24 or sid is None:
+                return False
+            op = op_by_id.get(sid)
+            if op is None:
+                return False
+            if op.op == "tt.load":
+                return True
+            return any(_reaches_a_load(o, _depth + 1)
+                       for o in (op.operand_ids or ()))
+
+        #: Ops that pass a value through unchanged as far as this guard is
+        #: concerned. The scores reach the mask add through at least one of
+        #: them (`ttg.convert_layout`, measured), so a walk that stopped at
+        #: the dot's direct consumers sees nothing.
+        _TRANSPARENT = ("ttg.convert_layout", "tt.reshape", "tt.broadcast",
+                        "tt.expand_dims", "arith.extf", "arith.truncf",
+                        "ttg.local_load", "ttg.local_alloc")
+
+        def _adds_a_loaded_tensor_to(dot_id):
+            """True when a loaded tensor is added onto this dot's result."""
+            frontier, seen = [dot_id], set()
+            while frontier:
+                sid = frontier.pop()
+                if sid in seen or len(seen) > 512:
+                    continue
+                seen.add(sid)
+                for cand in all_ops:
+                    if sid not in (cand.operand_ids or ()):
+                        continue
+                    if cand.op in ("arith.addf", "arith.subf"):
+                        for other in cand.operand_ids:
+                            if other != sid and _reaches_a_load(other):
+                                return True
+                        frontier.append(cand.id)
+                    elif cand.op in _TRANSPARENT:
+                        frontier.append(cand.id)
+            return False
+
+        if _adds_a_loaded_tensor_to(dot_qk.id):
+            return None
+
         # --- pointer roles + strides -----------------------------------------
         q_addr = _load_addr_for_dot_operand(dot_qk.operand_ids[0])
         k_addr = _load_addr_for_dot_operand(dot_qk.operand_ids[1])
@@ -5185,12 +5279,30 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             _refuse("the V pointer/stride chain")
 
         # Store target = Out. There must be exactly one tt.store.
+        # The OUTPUT store, chosen among several rather than assumed unique.
+        #
+        # This required `len(stores) == 1`. A real FlashAttention kernel has
+        # more: it writes the log-sum-exp (every FA does — it is what makes
+        # the pass composable), and Triton kernels that need a fixed
+        # reduction order round-trip an intermediate through a scratch
+        # buffer, which is two more. The kernel this was measured on has
+        # four, of which exactly one is the output.
+        #
+        # Selection, not guessing: the output store is the one whose address
+        # resolves to a full 4-leg [z, h, row, col] chain. The LSE store and
+        # the scratch round-trips are 1-D and resolve to None, so they
+        # exclude themselves. If zero or more than one store resolves that
+        # way, this refuses exactly as before — the doctrine is unchanged,
+        # only the assumption that an FA kernel stores once.
         stores = [s for s in all_ops if s.op == "tt.store"]
-        if len(stores) != 1 or not stores[0].operand_ids:
-            _refuse("the output store")
-        o_res = _extract_ptr_strides(stores[0].operand_ids[0])
-        if o_res is None:
-            _refuse("the Out pointer/stride chain")
+        _resolved = [(st, _extract_ptr_strides(st.operand_ids[0]))
+                     for st in stores if st.operand_ids]
+        _two_d = [(st, res) for st, res in _resolved if res is not None]
+        if len(_two_d) != 1:
+            _refuse(f"the output store ({len(stores)} stores, "
+                    f"{len(_two_d)} with a resolvable 2-D address chain)")
+        _out_store, _out_res = _two_d[0]
+        o_res = _out_res
 
         q_idx, q_strides = q_res
         k_idx, k_strides = k_res
