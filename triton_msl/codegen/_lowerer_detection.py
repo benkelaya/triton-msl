@@ -592,7 +592,7 @@ class _DetectionMixin:
                     op_name="tt.dot",
                 )
 
-    def _template_output_mask_nontrivial(self, is_fa):
+    def _template_output_mask_nontrivial(self, is_fa, ok_row_args=None):
         """True iff a dot-bearing kernel carries an output ``tt.store`` mask that
         RESTRICTS the output WITHIN the computed tile — a non-tile-boundary mask the
         matmul / FlashAttention TEMPLATES would SILENTLY DROP. They gate writes only on
@@ -654,6 +654,12 @@ class _DetectionMixin:
         # FA clips output ROWS by N_CTX; matmul clips rows by M and cols by N.
         ok_row_names = {"N_CTX"} if is_fa else {"M"}
         ok_col_names = set() if is_fa else {"N"}
+        # ...and, for FA, the argument the detector RESOLVED as the row bound,
+        # whatever it is called. Proving a mask trivial by the spelling of a
+        # variable fails every kernel that does not use the tutorial's names:
+        # the ordinary `offs_m < seqlen_q` is exactly the template's own row
+        # boundary and was judged to restrict the output within the tile.
+        ok_row_indices = set(ok_row_args or ())
 
         _IDX_WRAP = (
             "arith.addi",
@@ -711,7 +717,7 @@ class _DetectionMixin:
                 # leaves has_range as-is.
             return (extent, axis, has_pid) if has_range else None
 
-        def _bound_ok(bound_id, ok_names, idx_extent, has_pid):
+        def _bound_ok(bound_id, ok_names, idx_extent, has_pid, ok_row_idx=frozenset()):
             """True iff the comparison's BOUND is the template's output-extent arg for
             this axis (matching name) or a constant >= the tile extent."""
             seen = set()
@@ -728,7 +734,7 @@ class _DetectionMixin:
                 o = by_id.get(cur)
             arg = arg_by_id.get(cur)
             if arg is not None:
-                return arg.name in ok_names
+                return arg.name in ok_names or arg.index in ok_row_idx
             if o is not None and o.op == "arith.constant":
                 try:
                     val = int(o.attrs.get("value"))
@@ -767,7 +773,8 @@ class _DetectionMixin:
                 return False
             extent, axis, has_pid = idx_info
             ok_names = ok_col_names if axis == 0 else ok_row_names
-            return _bound_ok(bound_id, ok_names, extent, has_pid)
+            allowed = ok_row_indices if axis != 0 else frozenset()
+            return _bound_ok(bound_id, ok_names, extent, has_pid, allowed)
 
         def _mask_is_trivial(mask_id, depth=0):
             if depth > 64:
