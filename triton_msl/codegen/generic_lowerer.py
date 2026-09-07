@@ -57,6 +57,12 @@ def _op_is_exp(op_name: str) -> bool:
     return op_name in ("math.exp", "math.exp2", "tt.exp")
 
 
+#: The simdgroup FA template keeps its scores in simdgroup_matrix fragments,
+#: which cannot take a per-element additive bias without dismantling the MMA
+#: path. Kernels with a bias route to the tiled template instead.
+_fa_bias_supported_by_simd = False
+
+
 def _simd_fa_eligible(info):
     """True if the detected FA can use the simdgroup template: head_dim in {64, 128},
     block 32x32, fp32/fp16, AND contiguous innermost (head-dim) stride for all of
@@ -5489,6 +5495,17 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     self.index = index
 
             n_ctx_arg = _Resolved(n_ctx_idx)
+
+        # The QUERY length, resolved the same way from the Q load's own mask.
+        # A single-length template cannot decode: every token a model emits
+        # after the first is seqlen_q = 1 against a growing seqlen_k, and a
+        # padding mask exists precisely because the two differ. When the
+        # kernel has one bound for both — self-attention prefill, the
+        # tutorial's shape — both names resolve to the same argument and
+        # nothing changes.
+        n_ctx_q_idx = _bound_scalar_of(q_addr)
+        if n_ctx_q_idx is None:
+            n_ctx_q_idx = n_ctx_arg.index
         z_val = z_arg.index if z_arg is not None else C1
         h_val = h_arg.index if h_arg is not None else C1
 
@@ -5594,6 +5611,10 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             "Z": z_val,
             "H": h_val,
             "N_CTX": n_ctx_arg.index,
+            # The key length and the query length. Equal for prefill; distinct
+            # for decode and for anything padded.
+            "N_CTX_K": n_ctx_arg.index,
+            "N_CTX_Q": n_ctx_q_idx,
             "block_m": block_m,
             "block_n": block_n,
             "head_dim": head_dim,
@@ -5716,7 +5737,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # rows. So the mask-dropping templates refuse such a mask THEMSELVES here, using
         # the SAME shared triviality check as the chokepoint (so the two cannot diverge).
         # A trivially-true tile-boundary mask (om < N_CTX) / the no-mask case pass through.
-        if self._template_output_mask_nontrivial(is_fa=True):
+        # The row bound the template will clip on, resolved rather than named.
+        _row_bound = {info["N_CTX"]} if isinstance(info.get("N_CTX"), int) else set()
+        if isinstance(info.get("N_CTX_Q"), int):
+            _row_bound.add(info["N_CTX_Q"])
+        if self._template_output_mask_nontrivial(is_fa=True, ok_row_args=_row_bound):
             raise MetalNonRecoverableError(
                 "FlashAttention (head_dim=128) with a non-tile-boundary output store "
                 "mask is not supported: the simdgroup / tiled FA templates compute the "
@@ -5729,16 +5754,22 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 op_name="tt.dot",
             )
 
-        # The four pointer roles must be the first four args in canonical order
-        # (Q,K,V,Out = 0,1,2,3) — the template hard-codes Q/K/V/Out at buffers
-        # 0..3. The detector already required four DISTINCT roles; enforce the
-        # ORDER the template assumes (a permuted order would bind wrongly).
-        if not (info["q"] == 0 and info["k"] == 1 and info["v"] == 2 and info["out"] == 3):
+        # The four pointer roles must be DISTINCT. Their positions need not be
+        # 0..3 and need not be contiguous.
+        #
+        # This required the canonical order, on the grounds that the template
+        # hard-codes Q/K/V/Out at buffers 0..3. It does not: `arg_decls` below
+        # declares every pointer by its ROLE NAME at its REAL buffer index, so
+        # a permuted or interleaved order binds correctly. The requirement
+        # only excluded real kernels — a FlashAttention that carries a bias
+        # has Out at 4, not 3.
+        _roles = (info["q"], info["k"], info["v"], info["out"])
+        if len(set(_roles)) != 4:
             raise MetalNonRecoverableError(
-                "FlashAttention recognized but Q/K/V/Out are not the first four "
-                f"kernel args in order (got q={info['q']},k={info['k']},"
-                f"v={info['v']},out={info['out']}). Refusing to bind buffers in "
-                "the wrong order rather than risk silently-wrong output."
+                f"FlashAttention recognized but two pointer roles resolved to "
+                f"the same argument (q={info['q']}, k={info['k']}, "
+                f"v={info['v']}, out={info['out']}). Refusing rather than bind "
+                "one buffer to two roles."
             )
 
         # Defense-in-depth (carry item 2): cross-check Q/K/Out roles against the
@@ -5762,8 +5793,17 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         _ptr_args = [a for a in self.graph.args if a.is_ptr]
         roles = self._resolve_dot_ptr_roles(_dot_qk, _ptr_args)
         if roles is not None and len(roles) >= 3:
-            r_idx = {"q": roles[0].index, "k": roles[1].index, "out": roles[2].index}
-            if any(r_idx[k] != info[k] for k in ("q", "k", "out")):
+            # Q and K are positional in the resolver's answer and are compared
+            # as such. OUT is not: the resolver returns the dot's pointers in
+            # its own order, and a kernel carrying extra buffers — a bias, an
+            # LSE output, a scratch — puts something else in slot 2. It is
+            # checked by MEMBERSHIP instead, which is what the guard was
+            # actually for: the detector's Out must be one of the pointers this
+            # kernel touches, not whichever happens to land third.
+            r_idx = {"q": roles[0].index, "k": roles[1].index}
+            _resolved_any = {r.index for r in roles}
+            if (any(r_idx[k] != info[k] for k in ("q", "k"))
+                    or info["out"] not in _resolved_any):
                 raise MetalNonRecoverableError(
                     "FlashAttention Q/K/Out pointer roles disagree between the FA "
                     "detector and the generic dot-pointer resolver "
@@ -5780,7 +5820,15 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # NOT the triton names — those (``N_CTX``, ``Z``, ``H`` ...) would collide
         # with the template's logical-alias locals. Binding is by buffer INDEX,
         # so the scalar name is free. A index->msl-name map resolves logical dims.
-        ptr_names = {info["q"]: "Q", info["k"]: "K", info["v"]: "V", info["out"]: "Out"}
+        # Every pointer argument needs a name, not only the four the template
+        # reads. A real FlashAttention carries more — the bias, the
+        # log-sum-exp output, a scratch buffer used to pin a reduction order —
+        # and binding is POSITIONAL, so a pointer left undeclared shifts every
+        # buffer index after it. Unused ones are declared and ignored.
+        ptr_names = {info["q"]: "Q", info["k"]: "K", info["v"]: "V",
+                     info["out"]: "Out"}
+        if info.get("bias") is not None:
+            ptr_names[info["bias"]] = "Bias"
         args = self.graph.args
         arg_decls = []
         name_by_index = {}
@@ -5794,8 +5842,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             if a.is_ptr:
                 m = triton_type_to_msl(a.elem_type)
                 qual = "device const" if i != info["out"] else "device"
-                arg_decls.append(f"    {qual} {m}* {ptr_names[i]} [[buffer({i})]]")
-                name_by_index[i] = ptr_names[i]
+                # A pointer with no role in the template still gets a
+                # declaration so the positional binding stays aligned.
+                pname = ptr_names.get(i, f"fa_ptr{i}")
+                arg_decls.append(f"    {qual} {m}* {pname} [[buffer({i})]]")
+                name_by_index[i] = pname
             else:
                 buf_name = f"fa_arg{i}"
                 arg_decls.append(f"    constant uint& {buf_name} [[buffer({i})]]")
@@ -5836,6 +5887,10 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             "H": _expr(info["H"]),
             "N_CTX": _expr(info["N_CTX"]),
         }
+        if info.get("bias") is not None:
+            bs = info["bias_strides"]
+            bindings.update({"b_sz": _expr(bs[0]), "b_sh": _expr(bs[1]),
+                             "b_sm": _expr(bs[2]), "b_sn": _expr(bs[3])})
 
         # Emit under the kernel's real (sanitized) name so it matches
         # metadata["name"] the driver loads from the metallib (emit_msl sets
@@ -5844,7 +5899,20 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # the template accepts both spellings. fp16 emits half Q/K/V/Out (the
         # arg_decls above already use the args' real elem_type, so the pointer
         # types match) and applies the promote-on-load / cast-on-store epilogue.
-        if _simd_fa_eligible(info):
+        # A kernel carrying an additive bias goes to the TILED template.
+        #
+        # Both compute the same attention; they differ in where the scores
+        # live. The tiled template stages them in threadgroup memory, where a
+        # per-element bias is one add at the point the scaled score is
+        # written. The simdgroup template keeps them in simdgroup_matrix
+        # fragments, which are not addressable per element without undoing the
+        # thing that makes it fast.
+        #
+        # This is a routing decision, not a refusal: the bias is applied
+        # either way, and only the tile strategy changes.
+        _use_simd = _simd_fa_eligible(info) and (
+            info.get("bias") is None or _fa_bias_supported_by_simd)
+        if _use_simd:
             msl = make_flash_attention_kernel_simdgroup(
                 head_dim,
                 32,
@@ -5890,6 +5958,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 bindings=bindings,
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
                 scale=info["scale"],
+                bias=info.get("bias") is not None,
             )
             # scalar template: 1024 threads/threadgroup (BLOCK_M * BLOCK_N).
             self.effective_block_size = block_m * block_n

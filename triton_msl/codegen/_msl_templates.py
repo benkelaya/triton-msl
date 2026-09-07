@@ -2212,6 +2212,7 @@ def make_flash_attention_kernel_tiled(
     bindings=None,
     kernel_name="flash_attention",
     scale=None,
+    bias=False,
 ):
     """Generate a HEAD-DIM-TILED FlashAttention-2 kernel for Metal (fp32/fp16).
 
@@ -2336,6 +2337,29 @@ def make_flash_attention_kernel_tiled(
     # correctly.  When None, fall back to the canonical 1/sqrt(head_dim).
     SCALE = float(scale) if scale is not None else 1.0 / _math.sqrt(float(head_dim))
 
+    # The additive bias operand: a matrix added to the q.k^T scores before the
+    # online softmax, with four independent strides like Q/K/V/Out. It is how
+    # everything other than plain causality is expressed — an arbitrary
+    # attention mask, a padding mask, ALiBi, or a causal mask the caller
+    # materialised so that every tensor reaching the dot arrives by a single
+    # load.
+    #
+    # Added AFTER the scale, because that is where the reference kernel adds
+    # it: scaling a materialised -INFINITY is still -INFINITY, but scaling a
+    # finite bias would change it.
+    #
+    # Read under the SAME guard as the score. Outside it the score is already
+    # -INFINITY and the bias is not read at all, so there is no out-of-bounds
+    # load and no separate edge mask. A masked position composes without a
+    # special case: -inf plus anything finite is -inf, and exp(-inf - m) is 0.
+    #
+    # Broadcasting needs no flag: a [1, 1, M, N] mask arrives with b_sz and
+    # b_sh at zero and the address arithmetic below is unchanged.
+    bias_base = ("    uint b_base = z * b_sz + h * b_sh;" if bias else "")
+    bias_term = (" + (float)Bias[b_base + q_row * b_sm + kv_row * b_sn]"
+                 if bias else "")
+
+
     _LOGICAL = [
         "q_sz",
         "q_sh",
@@ -2357,6 +2381,11 @@ def make_flash_attention_kernel_tiled(
         "H",
         "N_CTX",
     ]
+    if bias:
+        # The bias carries four independent strides, exactly like Q/K/V/Out.
+        # Broadcasting over batch or head is a ZERO stride, not a flag, so the
+        # address arithmetic in the body needs no special case.
+        _LOGICAL = _LOGICAL + ["b_sz", "b_sh", "b_sm", "b_sn"]
     if arg_decls is None:
         # Canonical full ABI: Q,K,V,Out (0..3), 16 strides (4..19), Z,H,N_CTX
         # (20..22). Each logical name is its own buffer arg of the same name.
@@ -2414,6 +2443,7 @@ kernel void {kernel_name}(
     uint k_base = z * k_sz + h * k_sh;
     uint v_base = z * v_sz + h * v_sh;
     uint o_base = z * o_sz + h * o_sh;
+{bias_base}
 
     // Threadgroup memory.
     threadgroup float tg_S[{BLOCK_M} * {BLOCK_N}];   // BM x BN scores / probs
@@ -2484,7 +2514,7 @@ kernel void {kernel_name}(
                 float m_new = m_prev;
                 for (uint cj = 0u; cj < BN; cj++) {{
                     uint kv_row = kv_start + cj;
-                    float s = {score_guard} ? (tg_S[r * BN + cj] * scale)
+                    float s = {score_guard} ? (tg_S[r * BN + cj] * scale{bias_term})
                                                : -INFINITY;
                     tg_S[r * BN + cj] = s;   // store scaled score in place
                     m_new = max(m_new, s);
