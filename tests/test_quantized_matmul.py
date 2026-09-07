@@ -266,15 +266,23 @@ def test_quantized_gemv_in_reduce_scale_runs(N, K):
 
 @requires
 def test_fp32_gemv_not_misrouted():
-    # A plain fp32 GEMV (no dequant) must NOT be routed to the int8 GEMV kernel; it
-    # hits the loop-carried-reduce guard and refuses (correct-or-refuse).
+    """A plain fp32 GEMV (no dequant) must not take the int8 GEMV kernel.
+
+    It used to assert the loop-carried-reduce refusal, which was a proxy: the
+    kernel refused before routing could be observed at all. Since that shape
+    lowers (2026-09-07), the routing is checked by the answer — the int8 path
+    would dequantize weights that were never quantized, and `w @ x` is what
+    says it did not.
+    """
     torch.manual_seed(0)
     N, K, BN, BK = 128, 256, 32, 32
     x = torch.randn(K, device="mps")
     w = torch.randn(N, K, device="mps")
     o = torch.zeros(N, device="mps")
-    with pytest.raises(MetalNonRecoverableError, match="accumulated across a loop"):
-        _fp32_gemv[(triton.cdiv(N, BN),)](x, w, o, N, K, w.stride(0), w.stride(1), BN=BN, BK=BK)
+    _fp32_gemv[(triton.cdiv(N, BN),)](
+        x, w, o, N, K, w.stride(0), w.stride(1), BN=BN, BK=BK)
+    torch.mps.synchronize()
+    torch.testing.assert_close(o, w @ x, rtol=1e-2, atol=1e-2)
 
 
 @requires

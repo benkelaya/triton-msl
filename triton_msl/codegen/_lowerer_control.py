@@ -84,6 +84,10 @@ class _ControlFlowMixin:
         # loop). Maps index -> (n_elems, msl_type).
         mept_array_iter_indices = set()
         mept_array_iter_n = {}
+        # Indices of iter_args that are POINTERS, carried as their offset into
+        # a fixed base buffer.
+        ptr_iter_indices = set()
+        ptr_iter_base = {}
         # The scf.for result type tells us the true type of iter_args
         result_elem = ssa.elem_type or "f32"  # First result's type
         for i, init_id in enumerate(init_ids):
@@ -161,6 +165,49 @@ class _ControlFlowMixin:
                 mept_array_iter_n[i] = (n, msl_type)
                 continue
 
+            # A POINTER carried across the loop.
+            #
+            #   a_ptrs = A + offs_n[:, None] * s_an + offs_k[None, :] * s_am
+            #   for k in range(0, K, BK):
+            #       a = tl.load(a_ptrs, ...)
+            #       a_ptrs += BK * s_am
+            #
+            # is how every GEMV and most matmuls walk their operands, and the
+            # value going round the loop is an ADDRESS, not a number. A
+            # pointer here is tracked as (base buffer, offset expression), and
+            # only the offset changes — the buffer is the same one throughout.
+            # So the loop carries the OFFSET.
+            #
+            # Carrying it as a value instead emitted `float iter = A_ptr[...]`
+            # and then used that float as if it were a pointer — `iter[lid]`,
+            # `iter = iter[256]` — which is not valid MSL and failed to
+            # compile. It never mis-computed, but it refused every kernel of
+            # this shape, the vocabulary projection of a language model
+            # included.
+            if init_id in self.env_is_ptr:
+                base_ptr, base_off = self.env_is_ptr[init_id]
+                var_name = self._next_var("iter_off")
+                # long, because an offset into a real weight tensor overflows
+                # 32 bits sooner than one expects: a [32000, 4096] fp16 matrix
+                # is already 1.3e8 elements, and the offsets are per-element.
+                self.kb.raw_line(f"    long {var_name} = (long)({base_off});")
+                iter_vars.append(var_name)
+                iter_dtypes.append(init_type)
+                ptr_iter_indices.add(i)
+                ptr_iter_base[i] = base_ptr
+                continue
+            if init_id in getattr(self, "env_ptr_array", {}):
+                from triton_msl.errors import MetalNonRecoverableError
+
+                raise MetalNonRecoverableError(
+                    "a loop-carried pointer whose offsets are a per-thread "
+                    "register array (MEPT) is not lowered: the loop would have "
+                    "to advance every slot of the array, and only the scalar "
+                    "offset form is implemented. Refusing rather than emit a "
+                    "pointer that advances for one element and not the rest.",
+                    op_name="scf.for",
+                )
+
             var_name = self._next_var("iter")
             if init_type.startswith("f") or init_type.startswith("bf"):
                 msl_type = "float"
@@ -215,6 +262,13 @@ class _ControlFlowMixin:
                         n_arr, mt = mept_array_iter_n[i]
                         self.env_array[ba_id] = (var, n_arr, mt)
                         self.env_n_elems[ba_id] = n_arr
+                    # A pointer iter-arg: the body must see a POINTER, which
+                    # is the fixed base and the offset the loop carries. A
+                    # load/store through it, and any further addptr on it,
+                    # then resolve exactly as they do outside a loop.
+                    if i in ptr_iter_indices:
+                        self.env_is_ptr[ba_id] = (ptr_iter_base[i], var)
+                        self.env[ba_id] = f"{ptr_iter_base[i]}[{var}]"
                     # Register shared-memory-backed iter_args
                     if i in smem_iter_indices:
                         init_shape = self.env_shapes.get(init_ids[i], ()) if i < len(init_ids) else ()
@@ -357,6 +411,32 @@ class _ControlFlowMixin:
                                         for e in range(n_arr):
                                             self.kb.raw_line(f"        {iter_vars[i]}[{e}] = {yval};")
                                     continue
+                                if i in ptr_iter_indices:
+                                    y_ptr = self.env_is_ptr.get(yield_id)
+                                    if y_ptr is None:
+                                        from triton_msl.errors import MetalNonRecoverableError
+
+                                        raise MetalNonRecoverableError(
+                                            "a loop-carried pointer is yielded as "
+                                            "something that is not a pointer; refusing "
+                                            "rather than advance an address by a value.",
+                                            op_name="scf.yield",
+                                        )
+                                    y_base, y_off = y_ptr
+                                    if y_base != ptr_iter_base[i]:
+                                        from triton_msl.errors import MetalNonRecoverableError
+
+                                        raise MetalNonRecoverableError(
+                                            f"a loop-carried pointer changes BUFFER "
+                                            f"between iterations ({ptr_iter_base[i]} -> "
+                                            f"{y_base}): only the offset is carried, so "
+                                            f"the base must be loop-invariant. Refusing "
+                                            f"rather than read the wrong buffer.",
+                                            op_name="scf.yield",
+                                        )
+                                    self.kb.raw_line(
+                                        f"        {iter_vars[i]} = (long)({y_off});")
+                                    continue
                                 yield_val = self._lookup(yield_id)
                                 self.kb.raw_line(f"        {iter_vars[i]} = {yield_val};")
                     else:
@@ -382,6 +462,12 @@ class _ControlFlowMixin:
                         n_arr, mt = mept_array_iter_n[i]
                         self.env_array[rid] = (var, n_arr, mt)
                         self.env_n_elems[rid] = n_arr
+                    # A pointer result: the same base, at the offset the loop
+                    # left behind. A kernel that stores through the advanced
+                    # pointer after the loop then addresses correctly.
+                    if i in ptr_iter_indices:
+                        self.env_is_ptr[rid] = (ptr_iter_base[i], var)
+                        self.env[rid] = f"{ptr_iter_base[i]}[{var}]"
                     # Propagate shared_mem_desc for oversized iter_args
                     if i in smem_iter_indices:
                         init_shape = self.env_shapes.get(init_ids[i], ()) if i < len(init_ids) else ()
@@ -488,9 +574,29 @@ class _ControlFlowMixin:
                         yield_types.append(yt)
                     break
 
+            # Which yielded values are POINTERS. A branch that chooses WHICH
+            # buffer to read — `tl.cat` picking the input a program copies
+            # from — yields a pointer, and declaring it as a number emitted
+            # `float v = in_ptr;`, which does not compile. The branches choose
+            # different BUFFERS, so the variable has to be a pointer rather
+            # than an offset into a fixed one.
+            ptr_yield_types = {}
+            for body in (ssa.region_ops or []):
+                if body.op != "scf.yield":
+                    continue
+                for i, yid in enumerate(body.operand_ids or []):
+                    info = self._as_pointer_operand(yid)
+                    if info is not None:
+                        ptr_yield_types[i] = info[0]
+                break
+
             for i, rid in enumerate(result_ids):
                 var_name = f"ifr_{abs(rid)}_{i}"
                 result_vars.append((rid, var_name))
+                if i in ptr_yield_types:
+                    self.kb.raw_line(f"    {ptr_yield_types[i]} {var_name};")
+                    self.env_is_ptr[rid] = (var_name, "0")
+                    continue
                 yt = yield_types[i] if i < len(yield_types) else "fp32"
                 if yt.startswith("fp") or yt.startswith("bf") or yt.startswith("f"):
                     msl_type = "float"
@@ -512,8 +618,16 @@ class _ControlFlowMixin:
                 if body_op.op == "scf.yield":
                     for i, yield_id in enumerate(body_op.operand_ids):
                         if i < len(result_vars):
-                            yield_val = self._lookup(yield_id)
                             rid, var_name = result_vars[i]
+                            _pinfo = (self._as_pointer_operand(yield_id)
+                                      if rid in self.env_is_ptr
+                                      and self.env_is_ptr[rid][0] == var_name
+                                      else None)
+                            if _pinfo is not None:
+                                self.kb.raw_line(
+                                    f"        {var_name} = {_pinfo[1]};")
+                                continue
+                            yield_val = self._lookup(yield_id)
                             self.kb.raw_line(f"        {var_name} = {yield_val};")
                 else:
                     self._lower_op(body_op)
@@ -525,8 +639,16 @@ class _ControlFlowMixin:
                 if body_op.op == "scf.yield":
                     for i, yield_id in enumerate(body_op.operand_ids):
                         if i < len(result_vars):
-                            yield_val = self._lookup(yield_id)
                             rid, var_name = result_vars[i]
+                            _pinfo = (self._as_pointer_operand(yield_id)
+                                      if rid in self.env_is_ptr
+                                      and self.env_is_ptr[rid][0] == var_name
+                                      else None)
+                            if _pinfo is not None:
+                                self.kb.raw_line(
+                                    f"        {var_name} = {_pinfo[1]};")
+                                continue
+                            yield_val = self._lookup(yield_id)
                             self.kb.raw_line(f"        {var_name} = {yield_val};")
                 else:
                     self._lower_op(body_op)

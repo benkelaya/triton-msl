@@ -811,6 +811,68 @@ class _ReduceScanMixin:
             # Add this phase's ops to the preceding ops for future phases
             all_preceding_ops.extend(phase_ops)
 
+    def _reduce_result_also_broadcasts_2d(self, reduce_id):
+        """True iff the 2-D→1-D reduce ``reduce_id`` is ALSO used as a >=2-D
+        value — ``tt.expand_dims`` / ``tt.broadcast`` on it or on anything it
+        is carried into.
+
+        Companion to ``_reduce_result_reaches_1d_store``. That one says the
+        result needs one row per THREAD; this one says something also needs it
+        one row per SIMDGROUP. Either alone has a correct layout. Both at once
+        do not, and the caller refuses rather than pick.
+
+        Same forward walk, crossing ``scf.for`` loop-carries; purely a read
+        over the IR graph.
+        """
+
+        def _iter_all(ops):
+            for o in ops:
+                yield o
+                if getattr(o, "region_ops", None):
+                    yield from _iter_all(o.region_ops)
+                if getattr(o, "else_ops", None):
+                    yield from _iter_all(o.else_ops)
+
+        all_ops = list(_iter_all(self.graph.ops))
+        uses = {}
+        for op in all_ops:
+            for oid in op.operand_ids or []:
+                uses.setdefault(oid, []).append(op)
+        yield_to_for = {}
+        for op in all_ops:
+            if op.op == "scf.for" and op.region_ops:
+                for b in op.region_ops:
+                    if b.op == "scf.yield":
+                        yield_to_for[b.id] = op
+
+        seen = set()
+        stack = [reduce_id]
+        while stack:
+            vid = stack.pop()
+            if vid in seen:
+                continue
+            seen.add(vid)
+            for user in uses.get(vid, []):
+                if user.op in ("tt.expand_dims", "tt.broadcast"):
+                    return True
+                if user.op == "tt.store":
+                    continue
+                if user.op == "scf.yield":
+                    loop = yield_to_for.get(user.id)
+                    if loop is None:
+                        continue
+                    try:
+                        pos = list(user.operand_ids or []).index(vid)
+                    except ValueError:
+                        continue
+                    results = list(getattr(loop, "result_ids", None) or [])
+                    if pos < len(results):
+                        stack.append(results[pos])
+                    continue
+                if getattr(user, "id", None) is not None:
+                    stack.append(user.id)
+        return False
+
     def _reduce_result_reaches_1d_store(self, reduce_id):
         """True iff the 2-D→1-D reduce ``reduce_id`` reaches a 1-D ``tt.store`` as the
         stored VALUE — following forward uses and crossing ``scf.for`` loop-carries —
@@ -1018,21 +1080,36 @@ class _ReduceScanMixin:
                 # silently collapsing every output row to the first. The tile FITS
                 # (the coverage guard above passes), so this is a distinct silent-wrong;
                 # the fix needs loop-carry broadcast-layout propagation. Refuse.
+                _canonical = False
                 if self._reduce_result_reaches_1d_store(ssa.id):
-                    from triton_msl.errors import MetalNonRecoverableError
+                    # The result is carried across a loop and stored 1-D, so the
+                    # consumer wants one row per THREAD. Emit it that way rather
+                    # than in the row-broadcast layout — the two differ only in
+                    # which thread reads which slot of the result array, and the
+                    # array holds one entry per row either way.
+                    #
+                    # A result that ALSO goes back to 2-D (the online-softmax
+                    # `m_i[:, None]` shape) needs both layouts from one value,
+                    # and no single read serves both: that still refuses, now
+                    # saying which two demands collide.
+                    if self._reduce_result_also_broadcasts_2d(ssa.id):
+                        from triton_msl.errors import MetalNonRecoverableError
 
-                    raise MetalNonRecoverableError(
-                        "Refusing a 2-D axis reduce whose result is accumulated across a "
-                        "loop, e.g. `acc += tl.sum(x[None,:]*w, axis=1)` inside "
-                        "`for k in range(0, K, BK)`: the per-row reduce result is laid out "
-                        "one-row-per-simdgroup, but the loop-carried accumulator and 1-D "
-                        "store assume one-row-per-thread, which silently collapses every "
-                        "output row to the first. Reduce the whole axis in a single tile "
-                        "(no K-loop, BLOCK_K == K), or express the row-wise matmul as "
-                        "tl.dot(a, w). Correct-or-refuse: refused, not mis-computed.",
-                        op_name="tt.reduce",
-                    )
-                self._lower_reduce_2d(ssa, input_var, axis, combine_op, msl_type, shared_dtype, input_shape)
+                        raise MetalNonRecoverableError(
+                            "Refusing a 2-D axis reduce whose loop-carried result is "
+                            "BOTH stored 1-D and broadcast back to 2-D (e.g. an "
+                            "online softmax that rescales a 2-D accumulator with "
+                            "`m_i[:, None]` and also stores `m_i`): a 1-D store wants "
+                            "one row per thread and a 2-D consumer wants one row per "
+                            "simdgroup, and one value cannot be read both ways. Split "
+                            "the two uses into separate reduces, or store outside the "
+                            "loop. Correct-or-refuse: refused, not mis-computed.",
+                            op_name="tt.reduce",
+                        )
+                    _canonical = True
+                self._lower_reduce_2d(ssa, input_var, axis, combine_op, msl_type,
+                                      shared_dtype, input_shape,
+                                      canonical_layout=_canonical)
                 return
 
         # Stage B (in-loop reduction coverage): a 1-D full reduce whose tile
@@ -1726,7 +1803,8 @@ class _ReduceScanMixin:
                     return True
         return False
 
-    def _lower_reduce_2d(self, ssa, input_var, axis, combine_op, msl_type, shared_dtype, input_shape):
+    def _lower_reduce_2d(self, ssa, input_var, axis, combine_op, msl_type, shared_dtype,
+                         input_shape, canonical_layout=False):
         """Lower a 2D axis-specific reduction.
 
         For axis=1 on (M, N): each of M rows sums its N values.
@@ -1854,9 +1932,24 @@ class _ReduceScanMixin:
             self.kb.raw_line(f"        {result_shared}[lid] = acc;")
             self.kb.raw_line(f"    }}")
             self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
-            # All threads read their row's result.
-            # Row-major: threads [0..N-1] in row 0, [N..2N-1] in row 1.
-            self.kb.raw_line(f"    {result_var} = {result_shared}[lid / {N}u];")
+            # How the result is read back decides its LAYOUT, and there are two
+            # correct answers depending on what consumes it.
+            #
+            #   row-broadcast (default): thread lid holds row lid/N, which is
+            #     what a 2-D consumer wants — `x - tl.max(x, 1)[:, None]` needs
+            #     every thread of a row to see that row's value.
+            #   one row per thread: thread lid holds row lid, which is what a
+            #     1-D store and a loop-carried accumulator want.
+            #
+            # The result ARRAY is the same either way — one entry per row. Only
+            # the index each thread reads differs, and reading it the other way
+            # is what was missing: a GEMV's `acc += tl.sum(x[None,:]*w, axis=1)`
+            # in a K-loop then collapsed every output row onto the first.
+            if canonical_layout:
+                self.kb.raw_line(
+                    f"    {result_var} = (lid < {M}u) ? {result_shared}[lid] : ({msl_type}){identity};")
+            else:
+                self.kb.raw_line(f"    {result_var} = {result_shared}[lid / {N}u];")
             # Barrier AFTER the broadcast read: result_shared may alias the input shared
             # array (existing_shared reuse), and a following op that re-stages it (e.g. a
             # fused tt.scan's `shared[lid] = ...`) would otherwise race this read and a tail
@@ -1876,8 +1969,14 @@ class _ReduceScanMixin:
             self.kb.raw_line(f"        {result_shared}[lid] = acc;")
             self.kb.raw_line(f"    }}")
             self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
-            # All threads read their column's result
-            self.kb.raw_line(f"    {result_var} = {result_shared}[lid % {N}u];")
+            # All threads read their column's result. See the axis==1 branch for
+            # why the canonical form exists; here it coincides with the
+            # broadcast read on the first N threads and differs beyond them.
+            if canonical_layout:
+                self.kb.raw_line(
+                    f"    {result_var} = (lid < {N}u) ? {result_shared}[lid] : ({msl_type}){identity};")
+            else:
+                self.kb.raw_line(f"    {result_var} = {result_shared}[lid % {N}u];")
             # Barrier after the broadcast read — see the axis==1 branch (guards the
             # result_shared/input-shared alias against a following re-stage, e.g. a scan).
             self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")

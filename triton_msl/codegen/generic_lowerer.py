@@ -134,7 +134,7 @@ def _fa_small_tile_eligible(info):
     v_head_dim = info.get("v_head_dim", head_dim)
     if v_head_dim != head_dim:
         return False          # asymmetric is simd-only; the tiled template is symmetric
-    if info.get("out_dtype") not in ("f32", "f16"):
+    if info.get("out_dtype") not in ("f32", "f16", "bf16"):
         return False
     # The tiled template stages the head dim in Dc=64 chunks and requires an
     # exact multiple (it raises otherwise).
@@ -906,13 +906,6 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 for _d in _fa_dots
                 for _oid in (_d.operand_ids or [])
             )
-            if _fa_has_bf16:
-                raise MetalNonRecoverableError(
-                    "FlashAttention with bf16 dot operands is not supported: the "
-                    "attention lowering (fp32/fp16 only) silently mis-computes for "
-                    "bf16 at any head_dim. Refusing to emit silently-wrong output. "
-                    "Use fp16 or fp32 for Q/K/V in attention."
-                )
             # FUSED-SCALE-ON-DOT-RESULT GATE (naming-independence follow-up): the generic
             # attention lowering silently mis-computes when a tt.dot RESULT feeds an
             # elementwise scale/bias before the softmax — e.g. the scores scaled INSIDE
@@ -1017,7 +1010,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     info is not None
                     and info["block_m"] == 32
                     and info["block_n"] == 32
-                    and info["out_dtype"] in ("f32", "f16")
+                    and info["out_dtype"] in ("f32", "f16", "bf16")
                 ):
                     # Symmetric hd128 -> template (picks simd if contiguous, else tiled).
                     if not info.get("is_mla") and info["head_dim"] == 128 and info.get("v_head_dim", 128) == 128:
@@ -1058,7 +1051,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     and _info64["block_m"] == 32
                     and _info64["block_n"] == 32
                     and _info64["head_dim"] == 64
-                    and _info64["out_dtype"] in ("f32", "f16")
+                    and _info64["out_dtype"] in ("f32", "f16", "bf16")
                     and _simd_fa_eligible(_info64)
                 ):
                     return self._lower_flash_attention_template(_info64)
@@ -1070,6 +1063,26 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 if _fa_small_tile_eligible(_info64) and _info64["head_dim"] == 64:
                     return self._lower_flash_attention_template(_info64)
 
+            # DTYPE GATE (2026-06-21 audit), now reached only by kernels the
+            # TEMPLATES declined. The generic and C++ attention paths compute
+            # in the operand's own type and silently mis-compute for bf16
+            # (head_dim 32/64 dispatched wrong numbers, max err 0.4..218). The
+            # tiled template does not: it promotes every load to float, keeps
+            # the whole online softmax in fp32, and casts once on the store, so
+            # bf16 there is a container and not a precision — which is why this
+            # gate now sits BEHIND the routing instead of in front of it.
+            # Every weight in a modern checkpoint is bf16; refusing it before
+            # asking whether a template could take it refused the models
+            # themselves.
+            if _fa_has_bf16:
+                raise MetalNonRecoverableError(
+                    "FlashAttention with bf16 dot operands reached the generic "
+                    "attention lowering, which computes in the operand's own "
+                    "type and silently mis-computes bf16 at any head_dim. The "
+                    "tiled template takes bf16; this kernel did not route to it "
+                    "(head_dim, tile, or an unresolved parameter). Refusing to "
+                    "emit silently-wrong output."
+                )
             if _fa_maxdim > 64:
                 raise MetalNonRecoverableError(
                     f"FlashAttention head_dim > 64 (a dot tile dimension is "
@@ -1619,6 +1632,27 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 block_size = max(max_reduce_size, 1024)
                 block_size = min(block_size, 1024)
             else:
+                # A 2-D axis reduce stages its whole tile one element per
+                # thread, so a tile wider than the 1024-thread threadgroup has
+                # no lane to hold the rest.
+                #
+                # Say so. Falling through to the UNSUPPORTED marker reaches the
+                # caller as "generic lowerer could not lower this kernel", which
+                # names neither the op nor the number that has to change — and
+                # the number IS actionable: a caller whose tile comes from a
+                # hardware profile can carry one that fits. The legacy opt-in
+                # keeps its escape hatch.
+                if os.environ.get("TRITON_MSL_LEGACY") != "1":
+                    raise MetalNonRecoverableError(
+                        f"a 2-D axis reduce over a {max_reduce_size}-element tile "
+                        f"exceeds the 1024-thread threadgroup: the reduce stages "
+                        f"one element per thread, so the lanes past 1024 have "
+                        f"nothing to hold their part of the tile. Use a tile whose "
+                        f"product is <= 1024 (e.g. BLOCK_N * BLOCK_K for a GEMV), "
+                        f"or reduce in 1-D. Refusing rather than reduce part of "
+                        f"the tile.",
+                        op_name="tt.reduce",
+                    )
                 self._flash_too_large = True
         elif has_multivalue_reduce and block_size <= 1024:
             # Multi-value reduces (argmin/argmax) need per-element indices that
@@ -3650,6 +3684,38 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             for fn_src in fp8_device_functions(dtype):
                 self.kb._device_functions.append(fn_src)
 
+    def _as_pointer_operand(self, ssa_id):
+        """``(msl pointer type, expression)`` when this SSA value IS a pointer.
+
+        A pointer reaches a branch result or a select in exactly one kernel
+        shape and it is a common one: `tl.cat` picks WHICH input tensor a
+        program copies from, so the thing chosen is a buffer, not a number.
+        Lowered as a number it emitted `float v = in_ptr;` and then
+        subscripted the float — which does not compile, so the op refused.
+
+        The chosen value is `base + offset` folded into one pointer, because
+        the branches select different BUFFERS and a single (base, offset) pair
+        cannot name two. ``None`` when the value is not a pointer, which is
+        every other select and branch in the codebase.
+        """
+        info = self.env_is_ptr.get(ssa_id)
+        base = off = None
+        if info:
+            base, off = info
+        else:
+            expr = self.env.get(ssa_id)
+            if isinstance(expr, str):
+                for arg in self.graph.args:
+                    if arg.is_ptr and arg.name == expr:
+                        base, off = expr, "0"
+                        break
+        if base is None:
+            return None
+        from triton_msl.codegen.msl_types import triton_type_to_msl
+        elem = triton_type_to_msl(self._trace_ptr_dtype(ssa_id))
+        expr = base if str(off) in ("0", "(0)") else f"({base}) + ({off})"
+        return f"volatile device {elem}*", expr
+
     def _trace_ptr_dtype(self, ptr_id: int) -> str:
         """Trace a pointer SSA value back to its function arg dtype."""
         # ptr_id might be an addptr result
@@ -4514,6 +4580,22 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         true_val = self._lookup(ssa.operand_ids[1])
         false_val = self._lookup(ssa.operand_ids[2])
         var_name = self._next_var("r")
+
+        # A select between two POINTERS — which buffer to read, not which
+        # number. Emit a pointer variable; a load through it then resolves
+        # like a load through any other pointer.
+        _pt = self._as_pointer_operand(ssa.operand_ids[1])
+        _pf = self._as_pointer_operand(ssa.operand_ids[2])
+        if _pt is not None and _pf is not None:
+            ptr_ty, t_expr = _pt
+            _, f_expr = _pf
+            self.kb.raw_line(
+                f"    {ptr_ty} {var_name} = {cond} ? ({t_expr}) : ({f_expr});")
+            self.env[ssa.id] = var_name
+            self.env_is_ptr[ssa.id] = (var_name, "0")
+            self.env_types[ssa.id] = self._trace_ptr_dtype(ssa.operand_ids[1])
+            self._propagate_shape_elementwise(ssa)
+            return
 
         # Prefer ssa.elem_type (from the IR's result type) over operand tracking.
         # This preserves fp16/bf16 across select even though operands may have

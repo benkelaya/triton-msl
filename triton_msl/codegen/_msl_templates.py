@@ -2307,9 +2307,19 @@ def make_flash_attention_kernel_tiled(
     elif out_dtype in ("fp16", "f16"):
         elem_t = "half"
         store_cast = lambda expr: f"half({expr})"  # noqa: E731  (float -> half)
+    elif out_dtype in ("bf16", "bfloat16"):
+        # bfloat exists from Metal Shading Language 3.1. Nothing else changes:
+        # this template already promotes every load to float, computes and
+        # accumulates in fp32, and casts once on the final store — so bf16 is
+        # a container for the operands, not a precision the arithmetic runs
+        # in. That is what makes it safe here while the generic per-element
+        # path (which computes in the operand's own type) is not.
+        elem_t = "bfloat"
+        store_cast = lambda expr: f"bfloat({expr})"  # noqa: E731
     else:
         raise ValueError(
-            f"make_flash_attention_kernel_tiled: out_dtype must be one of fp32/f32/fp16/f16 (got {out_dtype!r})"
+            f"make_flash_attention_kernel_tiled: out_dtype must be one of "
+            f"fp32/f32/fp16/f16/bf16 (got {out_dtype!r})"
         )
     # Causal mask expression: emitted into the online-softmax row loop.
     # When causal=True the mask excludes kv positions *after* the query position

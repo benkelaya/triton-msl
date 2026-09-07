@@ -555,73 +555,45 @@ class TestFlashAttention:
             )
 
     @requires_triton
-    def test_bf16_large_head_refuses(self):
-        """Integrity: bfloat16 at head_dim=128, BLOCK=32 must REFUSE, never route.
+    def test_bf16_large_head_is_correct(self):
+        """bfloat16 at head_dim=128, BLOCK=32 must COMPUTE, and be right.
 
-        The tiled FA2 MSL template only handles fp32 and fp16 output (the routing
-        gate checks `out_dtype in ("f32", "f16")`). A bf16 kernel detects as FA
-        (dots + exp + max are present, head_dim=128), the detector returns
-        out_dtype="bf16", the routing condition fails, and the kernel falls through
-        to the `_fa_maxdim > 64` prescan guard which raises
-        `MetalNonRecoverableError`. The refusal happens at compile/lower time —
-        bf16 is never silently emitted as a wrong-dtype computation.
+        It used to refuse: the routing gate accepted `f32`/`f16` only, so a
+        bf16 kernel fell through to the head_dim>64 prescan. The tiled
+        template does not compute IN the operand dtype — it promotes every
+        load to float, keeps the online softmax in fp32 and casts once on the
+        store — so bf16 there is a container, and Metal has had `bfloat` since
+        Shading Language 3.1.
 
-        If the Triton frontend rejects bf16 before reaching the lowerer (e.g.
-        type-system error in tl.store/tl.dot), that is also acceptable: we assert
-        that compilation raises — NOT that output is silently wrong.
+        That mattered because every weight in a modern checkpoint is bf16:
+        refusing it before asking whether a template could take it refused the
+        models themselves.
 
-        Observed (2026-06-17): triton.compiler.errors.CompilationError —
-        "Both operands must be same dtype. Got fp32 and bf16" — raised at the
-        tl.dot type-checking layer before our lowerer is even reached.
-        MetalNonRecoverableError is kept in the tuple for the future case where
-        a Triton version accepts the bf16 types and our lowerer refuses it instead.
+        The bound is bf16's own: it carries about 8 bits of mantissa, so an
+        error of a few 1e-3 on values of this scale is the format, not the
+        kernel — a dropped or mis-typed operand shows up orders of magnitude
+        above it.
         """
         Z, H, N_CTX, HEAD_DIM, BLOCK = 1, 1, 64, 128, 32
         torch.manual_seed(42)
         q = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.bfloat16)
         k = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.bfloat16)
         v = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.bfloat16)
-        out = torch.empty_like(q)
+        out = torch.zeros_like(q)
         grid = (N_CTX // BLOCK, Z * H)
-        # Narrowed to the two semantically-meaningful exception types:
-        #   - _TritonCompilationError: frontend type-system rejection (current behavior)
-        #   - MetalNonRecoverableError: lowerer-level refusal (future fallback path)
-        # A bare Exception would also catch fixture bugs (AttributeError, KeyError, etc.)
-        # masking unrelated crashes. The match= regex enforces the refusal is about
-        # bf16/dtype/head_dim — not an unrelated crash.
-        with pytest.raises(
-            (MetalNonRecoverableError, _TritonCompilationError),
-            match=r"bf16|bfloat16|dtype|not supported|unsupported|head_dim",
-        ):
-            _flash_attn_fwd[grid](
-                q,
-                k,
-                v,
-                out,
-                q.stride(0),
-                q.stride(1),
-                q.stride(2),
-                q.stride(3),
-                k.stride(0),
-                k.stride(1),
-                k.stride(2),
-                k.stride(3),
-                v.stride(0),
-                v.stride(1),
-                v.stride(2),
-                v.stride(3),
-                out.stride(0),
-                out.stride(1),
-                out.stride(2),
-                out.stride(3),
-                Z,
-                H,
-                N_CTX,
-                BLOCK_M=BLOCK,
-                BLOCK_N=BLOCK,
-                HEAD_DIM=HEAD_DIM,
-                IS_CAUSAL=False,
-            )
+        _flash_attn_fwd[grid](
+            q, k, v, out,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            Z, H, N_CTX,
+            BLOCK_M=BLOCK, BLOCK_N=BLOCK, HEAD_DIM=HEAD_DIM, IS_CAUSAL=False,
+        )
+        assert torch.isfinite(out).all(), "bf16 attention produced non-finite values"
+        ref = _ref_attention(q.double(), k.double(), v.double())
+        err = (out.double() - ref).abs().max().item()
+        assert err < 1e-2, f"bf16 head_dim=128 max error {err}"
 
     @requires_triton
     @pytest.mark.parametrize("HEAD_DIM", [32, 64])
