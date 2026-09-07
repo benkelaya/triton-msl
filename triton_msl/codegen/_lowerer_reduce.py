@@ -1563,6 +1563,78 @@ class _ReduceScanMixin:
             self.env[ssa.result_ids[1]] = result_idx
             self.env_types[ssa.result_ids[1]] = "i32"
 
+    def _argminmax_result_reaches_1d_store(self, ssa):
+        """True iff a value or index this reduce produces is STORED 1-D.
+
+        The same layout question as `_reduce_result_reaches_1d_store`, asked of
+        the multi-value reduce and WITHOUT the loop-carry condition, because
+        here a direct store collapses too: the read-back
+        `result[lid / N]` gives thread `lid` row `lid/N`, and a 1-D store
+        writes thread `lid` to row `lid`, so every row but the first takes
+        row 0's answer.
+
+        Measured 2026-09-07 on `max(x, dim=1)` over a [3, N] tile: three rows
+        came back as three copies of row 0 — finite, plausible, and wrong at
+        every block size above one row.
+
+        A result that is broadcast back to >=2-D ends that branch, as before:
+        the row-broadcast layout is what such a consumer wants.
+        """
+
+        def _iter_all(ops):
+            for o in ops:
+                yield o
+                if getattr(o, "region_ops", None):
+                    yield from _iter_all(o.region_ops)
+                if getattr(o, "else_ops", None):
+                    yield from _iter_all(o.else_ops)
+
+        all_ops = list(_iter_all(self.graph.ops))
+        uses = {}
+        for op in all_ops:
+            for oid in op.operand_ids or []:
+                uses.setdefault(oid, []).append(op)
+        # scf.yield -> its enclosing scf.for, so the walk can cross a
+        # loop-carry. A running max over BLOCK_N chunks is carried that way,
+        # which is how every reduce over a sequence longer than one tile is
+        # written — and the walk stopped at the yield before this.
+        yield_to_for = {}
+        for op in all_ops:
+            if op.op == "scf.for" and op.region_ops:
+                for b in op.region_ops:
+                    if b.op == "scf.yield":
+                        yield_to_for[b.id] = op
+
+        seen = set()
+        stack = list(ssa.result_ids or []) + [ssa.id]
+        while stack:
+            vid = stack.pop()
+            if vid in seen:
+                continue
+            seen.add(vid)
+            for user in uses.get(vid, []):
+                if user.op in ("tt.expand_dims", "tt.broadcast"):
+                    continue                    # became >=2-D on this branch
+                if user.op == "tt.store":
+                    if len(user.operand_ids or []) >= 2 and user.operand_ids[1] == vid:
+                        return True
+                    continue
+                if user.op == "scf.yield":
+                    loop = yield_to_for.get(user.id)
+                    if loop is None:
+                        continue
+                    try:
+                        pos = list(user.operand_ids or []).index(vid)
+                    except ValueError:
+                        continue
+                    results = list(getattr(loop, "result_ids", None) or [])
+                    if pos < len(results):
+                        stack.append(results[pos])
+                    continue
+                if getattr(user, "id", None) is not None:
+                    stack.append(user.id)
+        return False
+
     def _lower_reduce_2d_argminmax(self, ssa, axis, input_shape):
         """Lower 2D argmin/argmax: find min/max value and index along axis.
 
@@ -1707,14 +1779,48 @@ class _ReduceScanMixin:
 
         self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
-        # Broadcast result to all threads.
-        # Row-major: threads [0..N-1] in row 0, [N..2N-1] in row 1.
+        # How the result is read back decides its LAYOUT, and there are two
+        # correct answers depending on the consumer — the same choice the
+        # single-value 2-D reduce makes.
+        #
+        #   row-broadcast: thread lid holds row lid/N, which is what a 2-D
+        #     consumer wants.
+        #   one row per thread: thread lid holds row lid, which is what a 1-D
+        #     store wants — and reading it the other way collapsed every row
+        #     onto the first (measured on max(x, dim=1) over [3, N]).
+        _canonical = self._argminmax_result_reaches_1d_store(ssa)
+        if _canonical:
+            # Tell the STORE which layout it is looking at. It decides between
+            # `lid < M` and the one-thread-per-row `lid % N == 0 && lid / N < M`
+            # from this set — "thread i has element i" — and emitting the
+            # canonical read-back without saying so left the store selecting
+            # one thread per row from a result that no longer lives there.
+            # That is why the values came back right and the INDICES came back
+            # zero: two halves of the same value read in two layouts.
+            ids = set(getattr(self, "_converted_layout_ids", set()))
+            ids.update(ssa.result_ids or [])
+            ids.add(ssa.id)
+            self._converted_layout_ids = ids
         if axis == 1:
-            self.kb.raw_line(f"    {result_val_var} = {result_val_shared}[lid / {N}u];")
-            self.kb.raw_line(f"    {result_idx_var} = {result_idx_shared}[lid / {N}u];")
+            if _canonical:
+                self.kb.raw_line(
+                    f"    {result_val_var} = (lid < {M}u) ? {result_val_shared}[lid] "
+                    f": ({msl_val_type}){identity};")
+                self.kb.raw_line(
+                    f"    {result_idx_var} = (lid < {M}u) ? {result_idx_shared}[lid] : 0;")
+            else:
+                self.kb.raw_line(f"    {result_val_var} = {result_val_shared}[lid / {N}u];")
+                self.kb.raw_line(f"    {result_idx_var} = {result_idx_shared}[lid / {N}u];")
         else:
-            self.kb.raw_line(f"    {result_val_var} = {result_val_shared}[lid % {N}u];")
-            self.kb.raw_line(f"    {result_idx_var} = {result_idx_shared}[lid % {N}u];")
+            if _canonical:
+                self.kb.raw_line(
+                    f"    {result_val_var} = (lid < {N}u) ? {result_val_shared}[lid] "
+                    f": ({msl_val_type}){identity};")
+                self.kb.raw_line(
+                    f"    {result_idx_var} = (lid < {N}u) ? {result_idx_shared}[lid] : 0;")
+            else:
+                self.kb.raw_line(f"    {result_val_var} = {result_val_shared}[lid % {N}u];")
+                self.kb.raw_line(f"    {result_idx_var} = {result_idx_shared}[lid % {N}u];")
         # Barrier AFTER the broadcast read of the pooled result arrays — without it a SECOND
         # argminmax in the same kernel re-stages those (declare_threadgroup_array-pooled)
         # arrays and races this read, so a tail of rows return their own index. Twin of the
