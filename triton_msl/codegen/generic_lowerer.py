@@ -5242,6 +5242,32 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 return _scalar_arg_of((op.operand_ids or [None])[0], _depth + 1)
             return None
 
+        def _loop_bound_of(load_id):
+            """The scalar ARG bounding the loop whose body contains `load_id`.
+
+            `scf.for` carries [start, end, step]; `end` is the sequence length
+            for the key/value walk of every FlashAttention.
+            """
+            def _contains(ops, wanted):
+                for st in ops:
+                    if st.id == wanted:
+                        return True
+                    if getattr(st, "region_ops", None) and _contains(st.region_ops, wanted):
+                        return True
+                    if getattr(st, "else_ops", None) and _contains(st.else_ops, wanted):
+                        return True
+                return False
+
+            for st in all_ops:
+                if st.op != "scf.for" or len(st.operand_ids or ()) < 3:
+                    continue
+                if not _contains(getattr(st, "region_ops", None) or [], load_id):
+                    continue
+                found = _scalar_arg_of(st.operand_ids[1])
+                if found is not None:
+                    return found
+            return None
+
         def _bound_scalar_of(addr_id):
             """The scalar ARG index a load's mask compares its index against.
 
@@ -5258,8 +5284,21 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                         and cand.operand_ids[0] == addr_id:
                     load_op = cand
                     break
-            if load_op is None or len(load_op.operand_ids or ()) < 2:
+            if load_op is None:
                 return None
+            if len(load_op.operand_ids or ()) < 2:
+                # An UNMASKED load. That is not a kernel without a bound — it
+                # is a kernel whose tiles divide the sequence exactly, so it
+                # needs no mask (`EVEN_N`: seqlen_k % BLOCK_N == 0). The bound
+                # is still there, as the trip count of the loop that walks the
+                # keys: `for start_n in range(0, seqlen_k, BLOCK_N)`.
+                #
+                # Without this, an evenly-divisible attention — a 64-long
+                # sequence with a 32 tile, the commonest shape there is —
+                # resolved no bound and refused, while a 48-long one resolved
+                # fine.
+                return _loop_bound_of(load_op.id)
+
 
             def _scalar_arg_under(sid, _depth=0):
                 if _depth > 16 or sid is None:
@@ -5276,6 +5315,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 return None
 
             frontier, seen = [load_op.operand_ids[1]], set()
+            # (the mask route; the loop route below covers the unmasked case)
             while frontier:
                 sid = frontier.pop()
                 if sid in seen or len(seen) > 128:
@@ -5535,6 +5575,32 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         z_val = z_arg.index if z_arg is not None else C1
         h_val = h_arg.index if h_arg is not None else C1
 
+        # H, resolved STRUCTURALLY when the kernel does not use that name.
+        #
+        # The grid's second axis carries z*h, and every FlashAttention splits
+        # it the same way: `off_b = pid1 // nheads; off_h = pid1 % nheads`.
+        # So H is the divisor of that division, whatever the kernel calls it —
+        # `nheads` in the reference implementation, `H` in the tutorial.
+        #
+        # Getting this wrong is silent: with H folded to 1, `z = zh / H` makes
+        # every head look like a new batch and the kernel reads past the end
+        # of Q. Measured 2026-09-07: a 2-head attention emitted `const uint
+        # H = 1u` and returned zeros.
+        if h_val is C1 or h_val == C1:
+            for _s in all_ops:
+                if _s.op not in ("arith.divsi", "arith.divui"):
+                    continue
+                _num = op_by_id.get((_s.operand_ids or [None])[0])
+                if _num is None or _num.op not in ("tt.get_program_id",
+                                                   "tt.program_id"):
+                    continue
+                if int(_num.attrs.get("axis", 0)) != 1:
+                    continue
+                _den = _scalar_arg_of((_s.operand_ids or [None, None])[1])
+                if _den is not None:
+                    h_val = _den
+                    break
+
         # --- causal: an arith.select of shape [block_m, block_n] whose operands
         # include the QK dot result (the tl.where(mask, qk, -inf) causal mask). For MLA
         # the mask is applied to the SUMMED score, i.e. the rope dot's result (the chain
@@ -5603,7 +5669,26 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # one. Anything still ambiguous after that refuses.
         bias_idx, bias_strides = None, None
         _candidates = []
-        for _addr in _loaded_addends_of(dot_qk.id):
+
+        # The bias may also arrive as the dot's ACCUMULATOR.
+        #
+        # `qk = tl.zeros(...); qk += tl.dot(q, kT); qk = qk + bias` is what the
+        # kernel says, but when the tiles divide the sequence exactly Triton
+        # folds the trailing add into the dot itself — `tt.dot(a, b, acc)` with
+        # the bias as `acc` — and there is then no `arith.addf` to find at all.
+        #
+        # Missing it is not a refusal, it is silence: the kernel lowers, the
+        # bias is dropped, and a causal request comes back non-causal. Measured
+        # 2026-09-07: a 64-long sequence with a 32 tile did exactly that while
+        # the 48-long one, which needs masks and so keeps the separate add,
+        # was correct.
+        _addends = list(_loaded_addends_of(dot_qk.id))
+        if len(dot_qk.operand_ids or ()) > 2:
+            _acc_addr = _load_addr_for_dot_operand(dot_qk.operand_ids[2])
+            if _acc_addr is not None:
+                _addends.append(_acc_addr)
+
+        for _addr in _addends:
             _res = _extract_ptr_strides(_addr)
             if _res is None:
                 _refuse("the bias pointer/stride chain")
