@@ -81,13 +81,30 @@ class _TemplateMixin:
         """
         axes = {s.attrs.get("axis", 0) for s in self.graph.ops
                 if s.op == "tt.get_program_id"}
-        if axes - {0}:
-            # The kernel really does use a multi-axis grid; take it as given.
-            self._used_pid_axes = {0, 1}
+        # A BATCH axis is not a tile axis. A batched matmul reads
+        # program_id(2) for the batch and still puts BOTH tile coordinates on
+        # the flat axis 0 — so the plain "does it use more than axis 0" test
+        # called that grid 2-D and read the column tile from pid3.y, which is 0
+        # for every program. Measured 2026-09-07: every batch computed its
+        # first column tile and nothing else.
+        _batch = self.resolve_matmul_batch_offsets() or {}
+        _batch_axes = {a for a, _ in _batch.values()}
+        # The TILE axes are what is left when the batch axis is taken out, and
+        # which axis carries what is the kernel's choice, not a convention.
+        # `(Bz, 1, 1)` with the batch on axis 0 and the tiles on 1 and 2 is as
+        # ordinary as `(tiles, 1, batch)`; reading pid_m from x either way
+        # takes the batch index for a row tile.
+        self._tile_axes = sorted(axes - _batch_axes) or [0]
+        self._pid3_is_vector = bool(_batch_axes) or len(self._tile_axes) > 1
+        self._used_pid_axes = set(self._tile_axes) | _batch_axes
+        if len(self._tile_axes) > 1:
+            # The kernel really does use a multi-axis tile grid; take it as given.
             lines.append("    uint3 pid3 [[threadgroup_position_in_grid]],")
             return False
-        self._used_pid_axes = {0}
-        lines.append("    uint pid3 [[threadgroup_position_in_grid]],")
+        if self._pid3_is_vector:
+            lines.append("    uint3 pid3 [[threadgroup_position_in_grid]],")
+        else:
+            lines.append("    uint pid3 [[threadgroup_position_in_grid]],")
         return True
 
     # (the body definitions are emitted by _emit_tile_ids_body, after the
@@ -95,13 +112,16 @@ class _TemplateMixin:
 
     def _emit_tile_ids_body(self, lines, flat, n_expr, bn_expr):
         """The pid_m / pid_n definitions matching the signature just emitted."""
+        _ta = getattr(self, "_tile_axes", [0, 1])
         if not flat:
-            lines.append("    uint pid_m = pid3.x;")
-            lines.append("    uint pid_n = pid3.y;")
+            lines.append(f"    uint pid_m = pid3.{'xyz'[_ta[0]]};")
+            lines.append(f"    uint pid_n = pid3.{'xyz'[_ta[1]]};")
             return
+        _flat = (f"pid3.{'xyz'[_ta[0]]}" if getattr(self, "_pid3_is_vector", False)
+                 else "pid3")
         lines.append(f"    uint _num_pid_n = ((uint)({n_expr}) + {bn_expr}u - 1u) / {bn_expr}u;")
-        lines.append("    uint pid_m = _num_pid_n ? (pid3 / _num_pid_n) : 0u;")
-        lines.append("    uint pid_n = _num_pid_n ? (pid3 % _num_pid_n) : 0u;")
+        lines.append(f"    uint pid_m = _num_pid_n ? ({_flat} / _num_pid_n) : 0u;")
+        lines.append(f"    uint pid_n = _num_pid_n ? ({_flat} % _num_pid_n) : 0u;")
 
 
     def _simdgroup_leading_dims_are_dense(self, info, descriptors):
@@ -175,6 +195,13 @@ class _TemplateMixin:
         return ("scalar", descriptors)
 
     def _refuse_if_pid_tiles_baked_output(self, has_M, has_N, what):
+        # A dim Triton specialized to a literal is not "baked as constexpr and
+        # unrecoverable" — it is written in the store's own mask, and
+        # `matmul_dim_constants` reads it. M == 1 is the common case (a batched
+        # matrix-VECTOR product), and it used to land here.
+        _resolved = self.matmul_dim_constants()
+        has_M = has_M or ("M" in _resolved)
+        has_N = has_N or ("N" in _resolved)
         """Single-source integrity guard for every matmul template that emits the
         whole baked output from a single threadgroup. If the kernel tiles the
         output across programs (program_id on the M/N axes) but M/N are baked
@@ -295,8 +322,16 @@ class _TemplateMixin:
             self._emit_tile_ids_body(
                 lines, _flat_grid, "N" if has_N else str(BLOCK_N), BLOCK_N)
 
-        lines.append(f"    uint _M = {'(uint)M' if has_M else f'{BLOCK_M}u'};")
-        lines.append(f"    uint _N = {'(uint)N' if has_N else f'{BLOCK_N}u'};")
+        # A dim specialized to a literal is read from the store's own mask
+        # (`matmul_dim_constants`); without it the template took BLOCK_M for
+        # the extent and wrote a whole tile where the output has one row.
+        _dim_consts = self.matmul_dim_constants()
+        _m_expr = ("(uint)M" if has_M
+                   else (f"{_dim_consts['M']}u" if "M" in _dim_consts else f"{BLOCK_M}u"))
+        _n_expr = ("(uint)N" if has_N
+                   else (f"{_dim_consts['N']}u" if "N" in _dim_consts else f"{BLOCK_N}u"))
+        lines.append(f"    uint _M = {_m_expr};")
+        lines.append(f"    uint _N = {_n_expr};")
         if has_K:
             lines.append("    uint _K = (uint)K;")
         else:
@@ -307,6 +342,21 @@ class _TemplateMixin:
                 lines.append(f"    uint _K = {BLOCK_K}u;")
         lines.append(f"    uint row_base = pid_m * {BLOCK_M}u;")
         lines.append(f"    uint col_base = pid_n * {BLOCK_N}u;")
+
+        # The batch. Each operand's base moves by the batch index times its own
+        # batch stride, exactly as the kernel's own `A_ptr += pid_b * stride_ab`
+        # does. A broadcast operand declares a zero batch stride and the term
+        # vanishes on its own — no flag decides it.
+        _batch = self.resolve_matmul_batch_offsets() or {}
+        _b_off = {"A": "0u", "B": "0u", "C": "0u"}
+        if _batch:
+            _axis = next(iter(_batch.values()))[0]
+            self._used_pid_axes = set(getattr(self, "_used_pid_axes", {0, 1})) | {_axis}
+            lines.append(f"    uint _batch = pid3.{'xyz'[_axis]};")
+            for _role, _pname in (("A", a_name), ("B", b_name), ("C", c_name)):
+                _adv = _batch.get(_pname)
+                if _adv is not None:
+                    _b_off[_role] = f"_batch * (uint){_adv[1]}"
         lines.append("")
         # Each thread strides over the BLOCK_M x BLOCK_N tile.
         lines.append(f"    for (uint _e = lid; _e < {tile}u; _e += {block_size}u) {{")
@@ -317,10 +367,10 @@ class _TemplateMixin:
         lines.append("        if (m >= _M || n >= _N) continue;")
         lines.append("        float _sum = 0.0f;")
         lines.append("        for (uint k = 0u; k < _K; k++) {")
-        lines.append(f"            _sum += (float){a_name}[m * {a_rs} + k * {a_cs}]")
-        lines.append(f"                  * (float){b_name}[k * {b_rs} + n * {b_cs}];")
+        lines.append(f"            _sum += (float){a_name}[{_b_off['A']} + m * {a_rs} + k * {a_cs}]")
+        lines.append(f"                  * (float){b_name}[{_b_off['B']} + k * {b_rs} + n * {b_cs}];")
         lines.append("        }")
-        lines.append(f"        {c_name}[m * {c_rs} + n * {c_cs}] = ({c_msl})_sum;")
+        lines.append(f"        {c_name}[{_b_off['C']} + m * {c_rs} + n * {c_cs}] = ({c_msl})_sum;")
         lines.append("    }")
         lines.append("}")
         return "\n".join(lines)
@@ -387,6 +437,18 @@ class _TemplateMixin:
         # simdgroup fast path (the common ~11 TFLOP/s case).
         decision = self._matmul_stride_decision(info)
         if decision is not None and decision[0] == "scalar":
+            return self._lower_strided_scalar_matmul(info, decision[1])
+
+        # A BATCHED matmul goes to the stride-aware scalar template whatever its
+        # strides say, because that is the one that can carry the batch: it
+        # addresses every operand explicitly, so a base offset is one more term.
+        # The simdgroup path bakes its addressing around the 2-D tile and has
+        # nowhere to put a third index — which is why a batch used to be
+        # refused outright rather than dropped.
+        #
+        # Slower, and correctness-first on purpose: batched MMA is the named
+        # follow-up, not a reason to keep refusing every batched matmul.
+        if decision is not None and self.resolve_matmul_batch_offsets():
             return self._lower_strided_scalar_matmul(info, decision[1])
 
         # BLOCKER 1: the NON-K-loop simple-dot simdgroup template loads each operand row
@@ -720,12 +782,17 @@ class _TemplateMixin:
         # emit wrong numbers. Shared guard (_refuse_if_pid_tiles_baked_output).
         self._refuse_if_pid_tiles_baked_output(has_M, has_N, "K-loop matmul")
 
+        _dim_consts = self.matmul_dim_constants()
         if has_M:
             lines.append(f"    uint _M = (uint)M;")
+        elif "M" in _dim_consts:
+            lines.append(f"    uint _M = {_dim_consts['M']}u;  // M specialized to a literal")
         else:
             lines.append(f"    uint _M = {BLOCK_M}u;  // no M arg, single tile")
         if has_N:
             lines.append(f"    uint _N = (uint)N;")
+        elif "N" in _dim_consts:
+            lines.append(f"    uint _N = {_dim_consts['N']}u;  // N specialized to a literal")
         else:
             lines.append(f"    uint _N = {BLOCK_N}u;  // no N arg, single tile")
         scf_iters = info.get("scf_iters")

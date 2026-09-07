@@ -2213,6 +2213,7 @@ def make_flash_attention_kernel_tiled(
     kernel_name="flash_attention",
     scale=None,
     bias=False,
+    kv_head_div=(1, 1),
 ):
     """Generate a HEAD-DIM-TILED FlashAttention-2 kernel for Metal (fp32/fp16).
 
@@ -2337,6 +2338,20 @@ def make_flash_attention_kernel_tiled(
         raise ValueError(
             "make_flash_attention_kernel_tiled: arg_decls and bindings must be provided together (or both omitted)"
         )
+
+    # Grouped-query attention: several query heads share one head of K and of
+    # V, and the kernel says which by dividing the head index before it
+    # multiplies by the stride. The template has to do the same division or it
+    # reads the query head's slot in a tensor that does not have one — head 5
+    # of 4, and so on for 28 of a 32-head model's query heads, off the end
+    # with a finite plausible answer.
+    _kdiv, _vdiv = (int(kv_head_div[0]), int(kv_head_div[1]))
+    if _kdiv < 1 or _vdiv < 1:
+        raise ValueError(
+            f"make_flash_attention_kernel_tiled: kv_head_div must be >= 1 "
+            f"(got {kv_head_div!r})")
+    k_head = "h" if _kdiv == 1 else f"(h / {_kdiv}u)"
+    v_head = "h" if _vdiv == 1 else f"(h / {_vdiv}u)"
 
     TPG = BLOCK_M * BLOCK_N  # threads per threadgroup
     KV_STAGE = max(BLOCK_M, BLOCK_N) * Dc  # shared K/V staging buffer size
@@ -2463,8 +2478,8 @@ kernel void {kernel_name}(
 
     // Per-(z,h) base offsets into each tensor.
     uint q_base = z * q_sz + h * q_sh;
-    uint k_base = z * k_sz + h * k_sh;
-    uint v_base = z * v_sz + h * v_sh;
+    uint k_base = z * k_sz + {k_head} * k_sh;
+    uint v_base = z * v_sz + {v_head} * v_sh;
     uint o_base = z * o_sz + h * o_sh;
 {bias_base}
 

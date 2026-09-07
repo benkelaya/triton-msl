@@ -5183,6 +5183,65 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     return a.index
             return None
 
+        #: Per-address head DIVISOR — how many query heads share one head of
+        #: this tensor. 1 for everything that is not grouped-query attention.
+        _head_div_by_addr = {}
+
+        def _head_divisor_from_muli(muli_id):
+            """``arith.muli(head_index, STRIDE)`` -> how the head index was
+            divided, or 1.
+
+            Grouped-query attention gives K and V fewer heads than Q and every
+            kernel writes the same thing: ``off_h_kv = off_h // GQA_GROUPS``,
+            then ``off_h_kv * stride_kh``. With GQA_GROUPS a constexpr the
+            division is folded to a constant divide or a shift, and the head
+            index reaching this multiply is that quotient rather than the raw
+            head.
+
+            Reading it is not optional. A template that indexes K by the QUERY
+            head reads head 5 of a tensor that has 4, for 28 of a 32-head
+            model's query heads — off the end of the tensor, with a plausible
+            finite answer. Measured 2026-09-07 on TinyLlama (32 query heads
+            over 4 key/value heads): the first decode step's attention.
+            """
+            op = op_by_id.get(muli_id)
+            if op is None or op.op != "arith.muli":
+                return 1
+            for oid in op.operand_ids:
+                a = arg_by_id.get(oid)
+                if a is not None and not a.is_ptr:
+                    continue                    # the stride
+                sub = op_by_id.get(oid)
+                seen = set()
+                while sub is not None and sub.id not in seen:
+                    seen.add(sub.id)
+                    if sub.op in ("arith.divsi", "arith.divui"):
+                        for did in (sub.operand_ids or [])[1:]:
+                            d = op_by_id.get(did)
+                            if d is not None and d.op == "arith.constant":
+                                try:
+                                    val = int(d.attrs.get("value"))
+                                except (TypeError, ValueError):
+                                    return 1
+                                return val if val > 0 else 1
+                        return 1
+                    if sub.op in ("arith.shrsi", "arith.shrui"):
+                        for did in (sub.operand_ids or [])[1:]:
+                            d = op_by_id.get(did)
+                            if d is not None and d.op == "arith.constant":
+                                try:
+                                    sh = int(d.attrs.get("value"))
+                                except (TypeError, ValueError):
+                                    return 1
+                                return 1 << sh if 0 <= sh < 30 else 1
+                        return 1
+                    if sub.op in ("arith.extsi", "arith.trunci",
+                                  "ttg.convert_layout"):
+                        sub = op_by_id.get((sub.operand_ids or [None])[0])
+                        continue
+                    break
+            return 1
+
         def _extract_ptr_strides(addr_id):
             """Walk the ``[BLOCK, HEAD_DIM]`` tensor-of-pointers addptr chain
             built by the standard 4-D addressing pattern::
@@ -5287,6 +5346,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 z_stride = _scalar_stride_from_muli(inner.operand_ids[1])
                 h_stride = outer_stride
                 base = arg_by_id.get(inner.operand_ids[0])
+                _head_div_by_addr[addr_id] = _head_divisor_from_muli(
+                    scal.operand_ids[1])
             else:
                 return None
             if base is None or not base.is_ptr:
@@ -5927,6 +5988,14 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # for decode and for anything padded.
             "N_CTX_K": n_ctx_arg.index,
             "N_CTX_Q": n_ctx_q_idx,
+            # Grouped-query attention: how many QUERY heads share one head of
+            # K and of V. 1 is plain multi-head attention and changes nothing.
+            "head_div": {
+                "q": _head_div_by_addr.get(q_addr, 1),
+                "k": _head_div_by_addr.get(k_addr, 1),
+                "v": _head_div_by_addr.get(v_addr, 1),
+                "o": 1,
+            },
             "block_m": block_m,
             "block_n": block_n,
             "head_dim": head_dim,
@@ -6260,9 +6329,20 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 "the mask as an additive bias, which states the alignment "
                 "explicitly."
             )
+        # The head each tensor is indexed by. Q, Out and the bias take the
+        # query head; K and V may take a group of query heads per head of
+        # their own — grouped-query attention, which is what every model
+        # larger than a toy uses now.
+        _head_div = info.get("head_div") or {}
+        _kv_div = (int(_head_div.get("k", 1) or 1), int(_head_div.get("v", 1) or 1))
+        if int(_head_div.get("q", 1) or 1) != 1:
+            raise MetalNonRecoverableError(
+                "FlashAttention indexes Q by a DIVIDED head index; the "
+                "templates take the query head as the grid's own and cannot "
+                "express that. Refusing rather than read the wrong head.")
         _use_simd = _simd_fa_eligible(info) and (
             info.get("bias") is None or _fa_bias_supported_by_simd) and (
-            not _distinct_lengths)
+            not _distinct_lengths) and _kv_div == (1, 1)
         if _use_simd:
             msl = make_flash_attention_kernel_simdgroup(
                 head_dim,
@@ -6310,6 +6390,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
                 scale=info["scale"],
                 bias=info.get("bias") is not None,
+                kv_head_div=_kv_div,
             )
             # scalar template: 1024 threads/threadgroup (BLOCK_M * BLOCK_N).
             self.effective_block_size = block_m * block_n

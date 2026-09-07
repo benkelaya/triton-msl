@@ -352,7 +352,29 @@ class _DetectionMixin:
                     break
         if a_addr is None or b_addr is None or c_addr is None:
             return None
-        return {"A": _strides(a_addr), "B": _strides(b_addr), "C": _strides(c_addr)}
+        out = {"A": _strides(a_addr), "B": _strides(b_addr), "C": _strides(c_addr)}
+
+        # An extent of 1 leaves no stride to infer, and none to get wrong.
+        #
+        # `[B, 1, K] @ [B, K, N]` — a batched matrix-VECTOR product, which is
+        # what attention decode is — has M == 1, so Triton folds the row index
+        # to the constant 0 and the row term disappears from the address
+        # arithmetic entirely. Reporting "un-inferable" there refuses a kernel
+        # whose addressing is completely determined: the row index is 0, so
+        # the row stride multiplies zero and any value is the same value. The
+        # literal 1 is reported to say "resolved, and it does not matter".
+        _dims = self.matmul_dim_constants()
+        if _dims.get("M") == 1:
+            for _role in ("A", "C"):
+                _row, _col = out[_role]
+                if _row is None:
+                    out[_role] = ("1", _col)
+        if _dims.get("N") == 1:
+            for _role in ("B", "C"):
+                _row, _col = out[_role]
+                if _col is None:
+                    out[_role] = (_row, "1")
+        return out
 
     def _inferred_stride_descriptors(self):
         """Address-traced 6-tuple of matmul stride descriptors, or None.
@@ -379,6 +401,95 @@ class _DetectionMixin:
         if any(s is None for s in (a_row, a_col, b_row, b_col, c_row, c_col)):
             return None
         return (a_row, a_col, b_row, b_col, c_row, c_col)
+
+    def resolve_matmul_batch_offsets(self):
+        """The BATCH advance on each of A/B/C, or ``None`` when it cannot be read.
+
+        A batched matmul advances its base pointers once, at the top of the
+        kernel, by the batch index times that operand's batch stride::
+
+            pid_b = tl.program_id(2)
+            A_ptr += pid_b * stride_ab
+            B_ptr += pid_b * stride_bb
+            out_ptr += pid_b * stride_ob
+
+        Returns ``{ptr_name: (pid_axis, stride_arg_name)}`` for the pointers
+        that carry such a term, with a SINGLE pid axis across all of them —
+        one batch index, which is what a batched matmul means. Returns None
+        when any pid-derived advance on a base pointer is not of that shape,
+        and the caller then refuses: a batch term that is read wrongly is a
+        kernel that computes one batch's tile for every batch, which is
+        exactly the silent-wrong this used to refuse wholesale.
+
+        A tensor-shaped advance (the batch term broadcast into the 2-D tile
+        offset) is NOT resolved here — only the scalar form every reference
+        implementation writes — so anything else keeps refusing.
+        """
+        op_by_id = {}
+
+        def _collect(ops):
+            for s in ops:
+                op_by_id[s.id] = s
+                if s.region_ops:
+                    _collect(s.region_ops)
+                if s.else_ops:
+                    _collect(s.else_ops)
+
+        _collect(self.graph.ops)
+        arg_by_id = {a.id: a for a in self.graph.args}
+        all_ptr_args = [a for a in self.graph.args if a.is_ptr]
+        dots = [s for s in op_by_id.values() if s.op == "tt.dot"]
+        if len(dots) != 1 or len(all_ptr_args) < 3:
+            return None
+        roles = self._resolve_dot_ptr_roles(dots[0], all_ptr_args)
+        ptrs = roles[:3] if (roles and len(roles) >= 3) else (
+            [all_ptr_args[0], all_ptr_args[1], all_ptr_args[-1]])
+        ptr_names = {p.name for p in ptrs}
+
+        def _pid_axis(sid, depth=0):
+            o = op_by_id.get(sid)
+            if o is None or depth > 8:
+                return None
+            if o.op in ("tt.get_program_id", "tt.program_id"):
+                try:
+                    return int(o.attrs.get("axis"))
+                except (TypeError, ValueError):
+                    return None
+            if o.op in ("arith.extsi", "arith.trunci", "ttg.convert_layout"):
+                return _pid_axis((o.operand_ids or [None])[0], depth + 1)
+            return None
+
+        found = {}
+        axes = set()
+        for o in op_by_id.values():
+            if o.op != "tt.addptr" or len(o.operand_ids) < 2:
+                continue
+            base = self._trace_ptr_source(o.operand_ids[0], op_by_id)
+            if base is None or base.name not in ptr_names:
+                continue
+            mul = op_by_id.get(o.operand_ids[1])
+            if mul is None or mul.op not in ("arith.muli", "arith.mul"):
+                continue
+            axis = stride_name = None
+            for oid in mul.operand_ids or []:
+                a = arg_by_id.get(oid)
+                if a is not None and not a.is_ptr:
+                    stride_name = a.name
+                    continue
+                ax = _pid_axis(oid)
+                if ax is not None:
+                    axis = ax
+            if axis is None or stride_name is None:
+                continue
+            if base.name in found and found[base.name] != (axis, stride_name):
+                return None            # two different advances on one pointer
+            found[base.name] = (axis, stride_name)
+            axes.add(axis)
+        if not found:
+            return None
+        if len(axes) != 1:
+            return None                # more than one batch index; not modeled
+        return found
 
     def _refuse_batched_matmul_base_offset(self):
         """Refuse loudly (MetalNonRecoverableError) when an A/B/C base pointer is
@@ -578,6 +689,14 @@ class _DetectionMixin:
             # simdgroup template drops. _is_batch_advance flattens the offset (scalar OR tensor)
             # and refuses any uniform pid term that is not a provable 2-D tile advance.
             if _is_batch_advance(o.operand_ids[1]):
+                # A batch advance that RESOLVES is carried, not dropped: the
+                # stride-aware scalar template offsets each base by the batch
+                # index times that operand's batch stride, which is what the
+                # kernel itself does. The refusal stands for anything that does
+                # not resolve — a term nothing applies is a term dropped, and
+                # that is batch 0's tile computed for every batch.
+                if self.resolve_matmul_batch_offsets() is not None:
+                    return
                 from triton_msl.errors import MetalNonRecoverableError
 
                 raise MetalNonRecoverableError(
@@ -592,8 +711,134 @@ class _DetectionMixin:
                     op_name="tt.dot",
                 )
 
+    def matmul_dim_constants(self):
+        """The output extents a matmul's store mask states as LITERALS.
+
+        Triton's ``equal_to_1`` specialization replaces any argument whose
+        value is 1 with the literal, so a matmul with M == 1 — a batched
+        matrix-VECTOR product, which is what attention decode and every
+        `[B, 1, K] @ [B, K, N]` is — has no ``M`` argument at all. The
+        templates then either guessed ``_M = BLOCK_M`` (writing 64 rows where
+        there is one) or refused for a baked constexpr dim.
+
+        The extent IS in the kernel, in the store's own mask
+        (``offs_m[:, None] < 1``), and reading it is exact. Returns
+        ``{"M": int}`` / ``{"N": int}`` for the axes whose bound is a
+        compile-time constant; axes bound by an argument are absent, because
+        those already resolve.
+
+        Deliberately narrow: only a constant bound on the OUTPUT store's mask,
+        only for a dot-bearing kernel. Anything else is not reported and the
+        existing refusals stand.
+        """
+
+        def _flatten(ops):
+            for s in ops:
+                yield s
+                if s.region_ops:
+                    yield from _flatten(s.region_ops)
+                if s.else_ops:
+                    yield from _flatten(s.else_ops)
+
+        allops = list(_flatten(self.graph.ops))
+        if not any(s.op == "tt.dot" for s in allops):
+            return {}
+        by_id = {s.id: s for s in allops}
+        stores = [s for s in allops if s.op == "tt.store" and len(s.operand_ids or []) >= 3]
+        if len(stores) != 1:
+            return {}
+
+        _WRAP = ("arith.addi", "arith.subi", "arith.muli", "tt.broadcast",
+                 "ttg.convert_layout", "tt.reshape", "tt.splat", "tt.expand_dims")
+
+        def _index_axis(start_id):
+            """(reaches a make_range, the expand_dims axis on the way)."""
+            seen, stack, axis, has_range = set(), [start_id], None, False
+            while stack:
+                vid = stack.pop()
+                if vid in seen:
+                    continue
+                seen.add(vid)
+                o = by_id.get(vid)
+                if o is None:
+                    continue
+                if o.op == "tt.make_range":
+                    has_range = True
+                    continue
+                if o.op == "tt.expand_dims":
+                    try:
+                        axis = int(o.attrs.get("axis"))
+                    except (TypeError, ValueError):
+                        pass
+                    stack.extend(o.operand_ids or [])
+                    continue
+                if o.op in _WRAP:
+                    stack.extend(o.operand_ids or [])
+            return has_range, axis
+
+        def _const_of(vid):
+            seen = set()
+            o = by_id.get(vid)
+            while (o is not None and o.id not in seen
+                   and o.op in ("tt.splat", "tt.broadcast", "ttg.convert_layout",
+                                "tt.reshape", "arith.extsi", "arith.trunci")
+                   and o.operand_ids):
+                seen.add(o.id)
+                o = by_id.get(o.operand_ids[0])
+            if o is not None and o.op == "arith.constant":
+                try:
+                    return int(o.attrs.get("value"))
+                except (TypeError, ValueError):
+                    return None
+            return None
+
+        out = {}
+
+        def _walk_mask(mask_id, depth=0):
+            if depth > 32:
+                return
+            o = by_id.get(mask_id)
+            if o is None:
+                return
+            if o.op in ("arith.andi", "tt.broadcast", "ttg.convert_layout",
+                        "tt.reshape", "tt.expand_dims"):
+                for c in (o.operand_ids or []):
+                    _walk_mask(c, depth + 1)
+                return
+            if o.op != "arith.cmpi" or len(o.operand_ids or []) < 2:
+                return
+            a, b = o.operand_ids[0], o.operand_ids[1]
+            ha, axa = _index_axis(a)
+            hb, _axb = _index_axis(b)
+            if ha and not hb:
+                idx_axis, bound = axa, b
+            elif hb and not ha:
+                idx_axis, bound = _axb, a
+            else:
+                return
+            val = _const_of(bound)
+            # ONLY the literal 1, and the restriction is the whole point.
+            #
+            # Inferring the extent FROM the mask and then using it to declare
+            # that same mask harmless is circular: `tl.store(o, acc, mask=rm <
+            # 40)` on a 64-row output would read 40 as the extent and drop a
+            # mask that removes 24 rows. The literal 1 is different in kind —
+            # it is the only value `equal_to_1` produces, so a bound of 1 with
+            # no argument beside it is a dim Triton specialized away, not a
+            # user's tighter bound. Any other literal keeps refusing.
+            if val != 1:
+                return
+            key = "N" if idx_axis == 0 else "M"
+            if key in out and out[key] != val:
+                out[key] = None          # contradictory: report nothing
+            else:
+                out.setdefault(key, val)
+
+        _walk_mask(stores[0].operand_ids[2])
+        return {k: v for k, v in out.items() if v}
+
     def _template_output_mask_nontrivial(self, is_fa, ok_row_args=None,
-                                         ok_row_consts=None):
+                                         ok_row_consts=None, ok_col_consts=None):
         """True iff a dot-bearing kernel carries an output ``tt.store`` mask that
         RESTRICTS the output WITHIN the computed tile — a non-tile-boundary mask the
         matmul / FlashAttention TEMPLATES would SILENTLY DROP. They gate writes only on
@@ -669,6 +914,13 @@ class _DetectionMixin:
         # clip, which is what this set carries: `seqlen_q = 1` on a decode
         # step, specialized to the literal by `equal_to_1`.
         ok_row_const_vals = set(ok_row_consts or ())
+        ok_col_const_vals = set(ok_col_consts or ())
+
+        _UNKNOWN_EXTENT = object()
+        _IDX_SWIZZLE = (
+            "arith.divsi", "arith.divui", "arith.remsi", "arith.remui",
+            "arith.minsi", "arith.minui", "arith.maxsi", "arith.maxui",
+        )
 
         _IDX_WRAP = (
             "arith.addi",
@@ -719,6 +971,18 @@ class _DetectionMixin:
                     stack.extend(o.operand_ids or [])
                     continue
                 if o.op in _IDX_WRAP:
+                    stack.extend(o.operand_ids or [])
+                    continue
+                if o.op in _IDX_SWIZZLE:
+                    # The GROUP_M swizzle: `pid // num_pid_n`, `pid % ...`,
+                    # `min(...)`. The tile index is still the tile index after
+                    # it — the divide only decides WHICH tile — so the walk
+                    # continues, but the make_range EXTENT no longer describes
+                    # the resulting span, and is dropped so the constant-bound
+                    # branch cannot compare against a span that is not there.
+                    # Without this the mask of every swizzled matmul looked
+                    # like "neither side is a tile index" and refused.
+                    extent = _UNKNOWN_EXTENT
                     stack.extend(o.operand_ids or [])
                     continue
                 # tt.get_program_id / arith.constant: scalar leaves of pid*BLOCK+range;
@@ -784,9 +1048,11 @@ class _DetectionMixin:
             if not upper:
                 return False
             extent, axis, has_pid = idx_info
+            if extent is _UNKNOWN_EXTENT:
+                extent = None
             ok_names = ok_col_names if axis == 0 else ok_row_names
             allowed = ok_row_indices if axis != 0 else frozenset()
-            allowed_consts = ok_row_const_vals if axis != 0 else frozenset()
+            allowed_consts = ok_row_const_vals if axis != 0 else ok_col_const_vals
             return _bound_ok(bound_id, ok_names, extent, has_pid, allowed,
                              allowed_consts)
 
@@ -854,7 +1120,11 @@ class _DetectionMixin:
         if is_fa:
             return
 
-        if self._template_output_mask_nontrivial(is_fa=False):
+        _dim_consts = self.matmul_dim_constants()
+        if self._template_output_mask_nontrivial(
+                is_fa=False,
+                ok_row_consts={_dim_consts["M"]} if "M" in _dim_consts else None,
+                ok_col_consts={_dim_consts["N"]} if "N" in _dim_consts else None):
             from triton_msl.errors import MetalNonRecoverableError
 
             raise MetalNonRecoverableError(
