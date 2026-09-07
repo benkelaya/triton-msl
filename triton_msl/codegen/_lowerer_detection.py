@@ -592,7 +592,8 @@ class _DetectionMixin:
                     op_name="tt.dot",
                 )
 
-    def _template_output_mask_nontrivial(self, is_fa, ok_row_args=None):
+    def _template_output_mask_nontrivial(self, is_fa, ok_row_args=None,
+                                         ok_row_consts=None):
         """True iff a dot-bearing kernel carries an output ``tt.store`` mask that
         RESTRICTS the output WITHIN the computed tile — a non-tile-boundary mask the
         matmul / FlashAttention TEMPLATES would SILENTLY DROP. They gate writes only on
@@ -660,6 +661,14 @@ class _DetectionMixin:
         # the ordinary `offs_m < seqlen_q` is exactly the template's own row
         # boundary and was judged to restrict the output within the tile.
         ok_row_indices = set(ok_row_args or ())
+        # ...and the row bounds that are LITERALS rather than arguments. A
+        # constant bound on a multi-block index is not trivial in general (see
+        # `_bound_ok`) — a constant between the tile width and the real total
+        # would clip the later blocks the template still writes. It IS trivial
+        # when the constant is the bound the TEMPLATE bakes into its own row
+        # clip, which is what this set carries: `seqlen_q = 1` on a decode
+        # step, specialized to the literal by `equal_to_1`.
+        ok_row_const_vals = set(ok_row_consts or ())
 
         _IDX_WRAP = (
             "arith.addi",
@@ -717,7 +726,8 @@ class _DetectionMixin:
                 # leaves has_range as-is.
             return (extent, axis, has_pid) if has_range else None
 
-        def _bound_ok(bound_id, ok_names, idx_extent, has_pid, ok_row_idx=frozenset()):
+        def _bound_ok(bound_id, ok_names, idx_extent, has_pid, ok_row_idx=frozenset(),
+                      ok_consts=frozenset()):
             """True iff the comparison's BOUND is the template's output-extent arg for
             this axis (matching name) or a constant >= the tile extent."""
             seen = set()
@@ -740,6 +750,8 @@ class _DetectionMixin:
                     val = int(o.attrs.get("value"))
                 except (TypeError, ValueError):
                     return False
+                if val in ok_consts:
+                    return True  # the template's own clip, written as a literal
                 # a CONSTANT bound on a MULTI-BLOCK index (pid*BLOCK+range) can't be
                 # proven trivial: the make_range extent is the per-block span, the index
                 # runs to a RUNTIME total -> a const between BLOCK and total clips later
@@ -774,7 +786,9 @@ class _DetectionMixin:
             extent, axis, has_pid = idx_info
             ok_names = ok_col_names if axis == 0 else ok_row_names
             allowed = ok_row_indices if axis != 0 else frozenset()
-            return _bound_ok(bound_id, ok_names, extent, has_pid, allowed)
+            allowed_consts = ok_row_const_vals if axis != 0 else frozenset()
+            return _bound_ok(bound_id, ok_names, extent, has_pid, allowed,
+                             allowed_consts)
 
         def _mask_is_trivial(mask_id, depth=0):
             if depth > 64:

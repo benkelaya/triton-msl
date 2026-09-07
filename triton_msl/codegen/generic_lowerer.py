@@ -106,6 +106,50 @@ def _simd_fa_eligible(info):
     return True
 
 
+def _fa_small_tile_eligible(info):
+    """True when a detected FA has a tile BELOW 32 that the TILED template takes.
+
+    A decode step is ``seqlen_q == 1``: the caller's hardware profile picks the
+    smallest query tile it has — 16 rows — and the kernel is then refused by the
+    ``< 32`` guard in ``lower()``. That guard is written for the GENERIC
+    per-thread lowering, which mis-computes every row past the first below 32.
+    The tiled template does not share the defect: its whole body is
+    ``for (uint i = lid; i < BM * BN; i += TPG)`` with BM and BN as parameters
+    and one thread per query row in the softmax pass, so a smaller tile is
+    fewer threads over strictly less threadgroup memory than the 32x32 shape
+    already validated — the same algorithm, not a different one.
+
+    Raising the caller's tile to 32 instead is not available. The tile comes
+    from a hardware profile every backend reads, so moving it to suit Metal
+    would move the numerics of a kernel running on CUDA.
+
+    Deliberately NARROW: it answers True only when a tile dimension is under
+    32, which is exactly the case that refuses today. Everything that reaches
+    a template now keeps reaching the same one, so this can add capability or
+    refuse identically — it cannot reroute a working kernel.
+    """
+    if info is None or info.get("is_mla"):
+        return False
+    head_dim = info.get("head_dim")
+    v_head_dim = info.get("v_head_dim", head_dim)
+    if v_head_dim != head_dim:
+        return False          # asymmetric is simd-only; the tiled template is symmetric
+    if info.get("out_dtype") not in ("f32", "f16"):
+        return False
+    # The tiled template stages the head dim in Dc=64 chunks and requires an
+    # exact multiple (it raises otherwise).
+    if not (isinstance(head_dim, int) and head_dim > 0 and head_dim % 64 == 0):
+        return False
+    bm, bn = info.get("block_m"), info.get("block_n")
+    if not (bm in (8, 16, 32) and bn in (8, 16, 32)):
+        return False
+    if bm == 32 and bn == 32:
+        return False          # the validated shape: nothing here applies to it
+    if bm * bn > 1024:        # Metal's threadgroup ceiling
+        return False
+    return True
+
+
 def _fa_half_accumulate(out_dtype) -> bool:
     """OPT-IN (default OFF): TRITON_MSL_FA_HALF_ACCUM=1 makes the simd FA use fp16
     (half8x8) MMA accumulators instead of fp32. ~4% faster at ~1% max-abs error — a
@@ -1018,6 +1062,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     and _simd_fa_eligible(_info64)
                 ):
                     return self._lower_flash_attention_template(_info64)
+                # A query tile under 32 rows — a decode step — goes to the tiled
+                # template, which is parameterised by the tile rather than built
+                # on 32-row MMA fragments. Without this the kernel falls through
+                # to the ``< 32`` refusal below, which describes the generic
+                # lowering's defect and not this path's.
+                if _fa_small_tile_eligible(_info64) and _info64["head_dim"] == 64:
+                    return self._lower_flash_attention_template(_info64)
 
             if _fa_maxdim > 64:
                 raise MetalNonRecoverableError(
@@ -1029,11 +1080,14 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             if _fa_mindim < 32:
                 raise MetalNonRecoverableError(
                     f"FlashAttention with a block tile dimension < 32 (smallest "
-                    f"dot tile dimension is {_fa_mindim}) is not supported: the "
-                    f"attention lowering silently mis-computes for BLOCK_M/BLOCK_N "
-                    f"below 32 (rows past the first become garbage), for any "
-                    f"head_dim. Refusing to emit silently-wrong output. Use "
-                    f"BLOCK_M = BLOCK_N = 32."
+                    f"dot tile dimension is {_fa_mindim}) is not supported by the "
+                    f"GENERIC attention lowering: it silently mis-computes for "
+                    f"BLOCK_M/BLOCK_N below 32 (rows past the first become "
+                    f"garbage), for any head_dim. The tiled template does take a "
+                    f"tile under 32 — that is how a decode step at seqlen_q = 1 "
+                    f"runs — but only for a kernel the FA detector resolves "
+                    f"completely at head_dim 64; this one did not reach it. "
+                    f"Refusing to emit silently-wrong output."
                 )
 
         # Check for the fused matmul + row-softmax pattern FIRST — before the
@@ -5268,8 +5322,16 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     return found
             return None
 
-        def _bound_scalar_of(addr_id):
+        def _bound_scalar_of(addr_id, allow_const=False):
             """The scalar ARG index a load's mask compares its index against.
+
+            With ``allow_const``, a bound that is a compile-time CONSTANT
+            resolves too, as ``("const", value)``. That is not an exotic case:
+            Triton's ``equal_to_1`` specialization replaces any argument whose
+            value is 1 with the literal, and a decode step is `seqlen_q = 1`
+            — so the query length of every token a model emits after the
+            first arrives as a constant and never as an argument. Refusing it
+            for not being an argument refuses decoding itself.
 
             `tl.load(ptr, mask=<index expr> < <scalar>)` lowers to a load whose
             mask operand is an `arith.cmpi`; one side reduces to a splat of a
@@ -5314,6 +5376,38 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                                              _depth + 1)
                 return None
 
+            def _reaches_make_range(sid, _depth=0, _seen=None):
+                """True if this side of the comparison is the tile INDEX."""
+                if _seen is None:
+                    _seen = set()
+                if sid is None or _depth > 32 or sid in _seen:
+                    return False
+                _seen.add(sid)
+                op = op_by_id.get(sid)
+                if op is None:
+                    return False
+                if op.op == "tt.make_range":
+                    return True
+                return any(_reaches_make_range(o, _depth + 1, _seen)
+                           for o in (op.operand_ids or ()))
+
+            def _const_under(sid, _depth=0):
+                """A splat/broadcast of an ``arith.constant`` -> its value."""
+                if _depth > 16 or sid is None:
+                    return None
+                op = op_by_id.get(sid)
+                if op is None:
+                    return None
+                if op.op == "arith.constant":
+                    try:
+                        return int(op.attrs.get("value"))
+                    except (TypeError, ValueError):
+                        return None
+                if op.op in ("tt.splat", "ttg.convert_layout", "tt.broadcast",
+                             "arith.extsi", "arith.trunci"):
+                    return _const_under((op.operand_ids or [None])[0], _depth + 1)
+                return None
+
             frontier, seen = [load_op.operand_ids[1]], set()
             # (the mask route; the loop route below covers the unmasked case)
             while frontier:
@@ -5329,6 +5423,16 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                         found = _scalar_arg_under(side)
                         if found is not None:
                             return found
+                    if allow_const:
+                        # The bound is whichever side is NOT the tile index.
+                        # Reading a constant off the index side would take the
+                        # tile width for the sequence length.
+                        for side in (op.operand_ids or ()):
+                            if _reaches_make_range(side):
+                                continue
+                            val = _const_under(side)
+                            if val is not None:
+                                return ("const", val)
                 frontier.extend(op.operand_ids or ())
             return None
 
@@ -5569,7 +5673,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # kernel has one bound for both — self-attention prefill, the
         # tutorial's shape — both names resolve to the same argument and
         # nothing changes.
-        n_ctx_q_idx = _bound_scalar_of(q_addr)
+        n_ctx_q_idx = _bound_scalar_of(q_addr, allow_const=True)
         if n_ctx_q_idx is None:
             n_ctx_q_idx = n_ctx_arg.index
         z_val = z_arg.index if z_arg is not None else C1
@@ -5651,6 +5755,21 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 "tt.trans",
                 "tt.reshape",
                 "ttg.convert_layout",
+                # A dtype cast between the scale multiply and the dot. The
+                # reference kernel writes `q = (q * softmax_scale).to(q.dtype)`,
+                # so on a fp16 kernel the chain is
+                #   dot.A <- local_load <- local_alloc <- truncf <- mulf,
+                # and stopping at the truncf loses the mulf that IS the scale.
+                # The kernel then refuses -- and because a head_dim-64 detection
+                # refusal falls through to the generic path, it refuses there
+                # for an unrelated reason (a 2-D axis reduce in a loop), which
+                # is why this looked like a reduce bug rather than a missing
+                # cast. These conversions change the dtype of the multiply's
+                # result, never WHICH multiply feeds the dot, so seeing through
+                # them resolves the scale without guessing -- the same reason
+                # `_load_addr_for_dot_operand` above walks through them.
+                "arith.truncf",
+                "arith.extf",
             ):
                 scale_id = op.operand_ids[0]
                 continue
@@ -5852,7 +5971,15 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         _row_bound = {info["N_CTX"]} if isinstance(info.get("N_CTX"), int) else set()
         if isinstance(info.get("N_CTX_Q"), int):
             _row_bound.add(info["N_CTX_Q"])
-        if self._template_output_mask_nontrivial(is_fa=True, ok_row_args=_row_bound):
+        # A row bound Triton specialized to a literal. The template bakes the
+        # SAME literal as its own row clip, so a store mask carrying it is the
+        # template's boundary written out, not a tighter mask being dropped.
+        _row_consts = {
+            int(v[1]) for v in (info.get("N_CTX"), info.get("N_CTX_Q"))
+            if isinstance(v, tuple) and len(v) == 2 and v[0] == "const"
+        }
+        if self._template_output_mask_nontrivial(
+                is_fa=True, ok_row_args=_row_bound, ok_row_consts=_row_consts):
             raise MetalNonRecoverableError(
                 "FlashAttention (head_dim=128) with a non-tile-boundary output store "
                 "mask is not supported: the simdgroup / tiled FA templates compute the "
@@ -5964,10 +6091,15 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 name_by_index[i] = buf_name
 
         def _expr(entry):
-            """Map a detector stride/dim entry (arg index or 'c1') to an MSL
-            expression: the buffer arg's name, or the literal 1u when folded."""
+            """Map a detector stride/dim entry (arg index, 'c1', or a resolved
+            constant) to an MSL expression: the buffer arg's name, or a
+            literal."""
             if entry == C1:
                 return "1u"
+            if isinstance(entry, tuple) and len(entry) == 2 and entry[0] == "const":
+                # A dim Triton specialized to a literal — `seqlen_q = 1` on a
+                # decode step. It is not present as an argument to bind.
+                return f"{int(entry[1])}u"
             if isinstance(entry, int) and entry in name_by_index:
                 return name_by_index[entry]
             # Unresolvable — must not silently bake a wrong value.
@@ -5998,6 +6130,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             "H": _expr(info["H"]),
             "N_CTX": _expr(info["N_CTX"]),
         }
+        # The query length, when the kernel carries it separately. Prefill has
+        # one length and both names resolve to the same argument, so the
+        # binding is omitted and the template's default (N_CTX) applies — the
+        # emitted text is unchanged for every kernel that had one length.
+        if info.get("N_CTX_Q") is not None and info["N_CTX_Q"] != info["N_CTX"]:
+            bindings["N_CTX_Q"] = _expr(info["N_CTX_Q"])
         if info.get("bias") is not None:
             bs = info["bias_strides"]
             bindings.update({"b_sz": _expr(bs[0]), "b_sh": _expr(bs[1]),
@@ -6021,8 +6159,28 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         #
         # This is a routing decision, not a refusal: the bias is applied
         # either way, and only the tile strategy changes.
+        # Distinct query / key lengths — a decode step, or a padded batch —
+        # go to the tiled template for the same kind of reason as the bias:
+        # the simdgroup template carries ONE sequence length, bounds both Q
+        # and K with it, and would read Q past its end. This is a routing
+        # decision, not a refusal; the tiled template takes both bounds.
+        _distinct_lengths = (
+            info.get("N_CTX_Q") is not None and info["N_CTX_Q"] != info["N_CTX"])
+        if _distinct_lengths and info["causal"]:
+            raise MetalNonRecoverableError(
+                "FlashAttention with a causal mask AND different query / key "
+                "lengths is not supported: with seqlen_q != seqlen_k a causal "
+                "mask has to say where the query rows sit in the key sequence, "
+                "and the two conventions in use (queries aligned to the start "
+                "of K, or to its end, as a decode step needs) produce different "
+                "answers from the same IR — the comparison the kernel lowers "
+                "does not say which. Refusing rather than pick one. Materialise "
+                "the mask as an additive bias, which states the alignment "
+                "explicitly."
+            )
         _use_simd = _simd_fa_eligible(info) and (
-            info.get("bias") is None or _fa_bias_supported_by_simd)
+            info.get("bias") is None or _fa_bias_supported_by_simd) and (
+            not _distinct_lengths)
         if _use_simd:
             msl = make_flash_attention_kernel_simdgroup(
                 head_dim,

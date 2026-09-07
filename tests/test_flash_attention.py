@@ -629,13 +629,23 @@ class TestFlashAttention:
     def test_small_block_refuses(self, BLOCK, HEAD_DIM):
         """Integrity guard for the small-BLOCK silent-wrong hole (closed 2026-06-17).
 
-        The attention lowering is validated ONLY at BLOCK_M = BLOCK_N = 32. With a
-        block tile dimension < 32 it silently mis-computes (rows past the first turn
-        to garbage, max err 28..1e4) — and this happens even for the otherwise
-        SUPPORTED head_dim 32 and 64, which the older head_dim>64 guard did not
-        catch. The prescan now refuses any FA-pattern kernel whose smallest dot
-        tile dim is < 32. (head_dim 32/64 at BLOCK=32 stay supported — tested above.)
+        The GENERIC attention lowering silently mis-computes with a block tile
+        dimension < 32 (rows past the first turn to garbage, max err 28..1e4),
+        including at the otherwise supported head_dim 32 and 64, so the prescan
+        refuses any FA-pattern kernel whose smallest dot tile dim is < 32.
+
+        head_dim 64 is the exception, since 2026-09-07: it routes to the TILED
+        template, which is parameterised by the tile instead of assuming 32, and
+        a smaller tile there is fewer threads over less threadgroup memory — the
+        same algorithm. That case is asserted CORRECT by
+        ``test_small_block_head_dim_64_is_correct`` below rather than refused; a
+        decode step is one query row and cannot be computed any other way. The
+        tiled template stages the head dim in 64-wide chunks, so head_dim 32 has
+        no template to route to and still refuses here.
         """
+        if HEAD_DIM == 64:
+            pytest.skip("head_dim 64 routes to the tiled template — see "
+                        "test_small_block_head_dim_64_is_correct")
         Z, H, N_CTX = 1, 1, 16
         torch.manual_seed(42)
         q = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.float32)
@@ -673,6 +683,36 @@ class TestFlashAttention:
                 HEAD_DIM=HEAD_DIM,
                 IS_CAUSAL=False,
             )
+
+    @requires_triton
+    @pytest.mark.parametrize("BLOCK", [16, 8])
+    def test_small_block_head_dim_64_is_correct(self, BLOCK):
+        """The other half of the guard above: at head_dim 64 a tile under 32
+        is COMPUTED, and must be right.
+
+        This is the shape a decode step takes — one query row, a tile of 8 or
+        16 rows around it — so refusing it refuses decoding. The rows the tile
+        has beyond the sequence are guarded, not computed away.
+        """
+        Z, H, N_CTX, HEAD_DIM = 1, 1, 16, 64
+        torch.manual_seed(42)
+        q = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.float32)
+        k = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.float32)
+        v = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.float32)
+        out = torch.zeros_like(q)
+        grid = ((N_CTX + BLOCK - 1) // BLOCK, Z * H)
+        _flash_attn_fwd[grid](
+            q, k, v, out,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            Z, H, N_CTX,
+            BLOCK_M=BLOCK, BLOCK_N=BLOCK, HEAD_DIM=HEAD_DIM, IS_CAUSAL=False,
+        )
+        ref = _ref_attention(q.double(), k.double(), v.double())
+        err = (out.double() - ref).abs().max().item()
+        assert err < 1e-5, f"BLOCK={BLOCK} head_dim=64 max error {err}"
 
     @requires_triton
     @pytest.mark.parametrize("HEAD_DIM", [32, 64])

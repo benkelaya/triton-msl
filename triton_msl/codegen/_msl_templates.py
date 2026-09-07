@@ -2408,6 +2408,18 @@ def make_flash_attention_kernel_tiled(
     # Local aliases so the body references uniform names regardless of which
     # strides/dims are real buffer args vs baked constants.
     bind_lines = "\n".join(f"    const uint {name} = {bindings[name]};" for name in _LOGICAL)
+    # The QUERY length, as its own bound.
+    #
+    # Q and K are the same length only in prefill. Every token a model emits
+    # after the first is one query row against a key sequence that keeps
+    # growing, and a padding mask exists precisely because the two differ.
+    # Guarding the query rows with the KEY length reads Q past its end on a
+    # decode step and writes Out past its end.
+    #
+    # OPTIONAL, and defaulted to N_CTX: a caller that has one length passes
+    # nothing and gets exactly the kernel it got before — same buffers, same
+    # ABI, same emitted text.
+    bind_lines += "\n    const uint N_CTX_Q = %s;" % bindings.get("N_CTX_Q", "N_CTX")
 
     return f"""#include <metal_stdlib>
 using namespace metal;
@@ -2491,7 +2503,7 @@ kernel void {kernel_name}(
                 uint cj = i % BN;         // kv row within block
                 uint q_row = q_start + r;
                 uint kv_row = kv_start + cj;
-                if (q_row < N_CTX && kv_row < N_CTX) {{
+                if (q_row < N_CTX_Q && kv_row < N_CTX) {{
                     float dot = 0.0f;
                     for (uint c = 0u; c < DC; c++) {{
                         float qv = Q[q_base + q_row * q_sm + (dc + c) * q_sk];
@@ -2507,7 +2519,7 @@ kernel void {kernel_name}(
         if (lid < BM) {{
             uint r = lid;
             uint q_row = q_start + r;
-            if (q_row < N_CTX) {{
+            if (q_row < N_CTX_Q) {{
                 float m_prev = tg_m[r];
                 float l_prev = tg_l[r];
 
@@ -2579,7 +2591,7 @@ kernel void {kernel_name}(
         uint r = i / D;
         uint c = i % D;
         uint q_row = q_start + r;
-        if (q_row < N_CTX) {{
+        if (q_row < N_CTX_Q) {{
             float l_val = tg_l[r];
             float o = (l_val > 0.0f) ? (acc[i] / l_val) : 0.0f;
             Out[o_base + q_row * o_sm + c * o_sk] = {store_cast("o")};
