@@ -1933,24 +1933,36 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 # these kernels; they emitted INVALID MSL, which is worse than
                 # a refusal.
                 #
-                # The real blocker is downstream and is recorded here so the
-                # next attempt does not re-derive it: a shared-memory-staged
-                # tt.dot stages its operand with
+                # The real blocker is a SCOPE problem, recorded here so the
+                # next attempt does not re-derive it. To stage a
+                # shared-memory-staged tt.dot's operands the emitter closes
+                # the per-element loop, emits
                 #   for (_sa = lid; _sa < 1024u; _sa += 1024u) smem[_sa] = val;
-                # one element per thread, assigning a value COMPUTED in the
-                # per-element loop. Under a wrapped tile that loop has already
-                # closed (so the value is out of scope) and covers 4096
-                # elements against the staging's 1024. The staging does not
-                # hold under wrapping at all; hoisting the index values, which
-                # an earlier note proposed, would not fix it.
+                # and reopens it. `val` was computed INSIDE the closed loop, so
+                # the MSL references an undeclared identifier.
+                #
+                # The staging itself is correctly sized — the operand tile is
+                # 1024 and each thread stages one element, which is that
+                # branch's own contract. (An earlier note here claimed it
+                # staged a quarter of the operand by confusing the operand's
+                # 1024 with the accumulator's 4096; it does not.)
+                #
+                # Nor is a naive hoist sufficient: the wrap iterates
+                # `_loop_e ∈ {lid, lid+1024, ...}` and the staging wants the
+                # value at the FIRST iteration, so keeping the variable's last
+                # value would stage the wrong element into slot `lid`. The
+                # operand's dependency chain has to be replayed outside the
+                # loop with the index bound to `lid`.
                 raise MetalNonRecoverableError(
                     f"a {block_size}-element tile needs {block_size} threads and "
                     f"a threadgroup holds at most 1024. The kernel carries a "
-                    f"shared-memory-staged tt.dot, whose operand staging maps "
-                    f"one element per thread and cannot cover a wrapped tile — "
-                    f"not because a barrier in the loop would diverge, which at "
-                    f"a multiple of 1024 it would not. Use a tile whose product "
-                    f"is <= 1024, or split the kernel.",
+                    f"shared-memory-staged tt.dot: staging its operands closes "
+                    f"the per-element loop, and the operand value was computed "
+                    f"inside it, so the emitted MSL would reference an "
+                    f"out-of-scope identifier. Not a barrier-divergence "
+                    f"problem — at a multiple of 1024 every thread reaches "
+                    f"every barrier the same number of times. Use a tile whose "
+                    f"product is <= 1024, or split the kernel.",
                     op_name="tt.dot",
                 )
             self._needs_wrapping = True
