@@ -7573,6 +7573,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             return expr if coeff is None else f"({expr} * {coeff})"
 
         if depth > 64:
+            self._staged_fill_blocker = "recursion depth > 64"
             return None
         op = op_by_id.get(nid)
         if op is None:
@@ -7631,6 +7632,9 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 return self._staged_fill_terms(b, _mul_coeff(coeff, ca), axis_dim, op_by_id, depth + 1)
             return None
         # Any other op breaks structural resolution.
+        # Nothing matched: record WHICH op could not be reduced, so the
+        # refusal can name it instead of saying only that something failed.
+        self._staged_fill_blocker = name
         return None
 
     def _rebuild_staged_fill_mask(self, mask_id, op_by_id, M, N):
@@ -7755,10 +7759,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         const_terms = []  # block-constant contributions (same for all _sa)
 
         def _refuse():
+            blocker = getattr(self, "_staged_fill_blocker", None)
+            named = f" The term that could not be reduced is `{blocker}`." if blocker else ""
             raise MetalNonRecoverableError(
                 "triton-msl: cannot structurally resolve an offset term of a "
                 "shared-memory-staged tt.dot operand to a (row/col, stride) "
-                "index or a block-constant. Refusing to emit a "
+                "index or a block-constant." + named + " Refusing to emit a "
                 "possibly-transposed staging rather than risk a silent "
                 "miscompute (correct-or-refuse)."
             )
