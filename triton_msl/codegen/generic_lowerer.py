@@ -329,6 +329,18 @@ _MATMUL_EPILOGUE_REFUSE_MSG = (
 # ---------------------------------------------------------------------------
 
 
+_TRACE_THROUGH_INT_ARITH = frozenset({
+    # Integer elementwise ops whose result varies along the same axis as any
+    # range they are derived from. Closed as a family rather than extended
+    # one op at a time: `addi` was followed and `subi` was not, which is a
+    # distinction nothing justifies. See _trace_to_make_range's docstring for
+    # the im2col chain that proved the gap.
+    "arith.addi", "arith.subi", "arith.muli",
+    "arith.divsi", "arith.divui",
+    "arith.remsi", "arith.remui",
+})
+
+
 class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _DetectionMixin, _TemplateMixin):
     """Lower an IRGraph to MSL source code via KernelBuilder."""
 
@@ -2588,16 +2600,50 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 if rs and not rl:
                     self._make_range_store_only.add(mr_id)
 
-    def _trace_to_make_range(self, ssa_id, ops, op_by_id):
+    def _trace_to_make_range(self, ssa_id, ops, op_by_id, visited=None):
         """Trace an SSA ID back through passthrough ops to find a make_range.
 
         Follows: passthroughs (extsi, convert_layout, etc.), tt.load (through
         the pointer operand), tt.addptr (through the offset operand), and
-        arithmetic ops (muli, addi — tries both operands).
+        integer arithmetic (tries every operand).
         This allows tracing from expand_dims through load→addptr→make_range
         chains, which is needed when a 1D load result gets expand_dims'd to 2D.
+
+        The arithmetic set is the whole integer-elementwise family, not just
+        add and multiply. A value derived from a range varies along that
+        range's axis whatever the operation, and whether the range is the
+        left or the right operand — `x // w` and `x % h` vary along x's axis
+        exactly as `x + c` does. Only ADD and MUL were followed before, and an
+        im2col address decomposes a flat index with DIV and MOD:
+
+            bhw   = pid * BLOCK + arange(0, BLOCK)   # the tile's ROW
+            bh    = bhw // out_width
+            h_off = bh  %  out_height                # [:, None] — still ROW
+            w_off = bhw %  out_width                 # [:, None] — still ROW
+
+        The trace stopped at the `//`, no dimension was recorded for the
+        range, and the fallback gave it the COLUMN index `lid % N`. Measured
+        2026-09-08 on conv2d_forward_kernel: the staged input tile's spatial
+        index came out `lid % 32` where the weight tile's — reached by a
+        one-step `c + arange(...)` chain the trace did survive — correctly
+        came out `lid / 32`. Every thread of a row then read the same input
+        position, and the output was constant along the width axis: 24 of
+        2048 elements within 2e-2 of an fp64 oracle, on BOTH configs that
+        compile, each wrong in its own way. It is a SILENT wrong — nothing
+        refuses, nothing warns; the autotune consensus screen caught it only
+        because the two survivors disagreed with each other, and would have
+        accepted them had they agreed.
         """
-        visited = set()
+        # One visited set for the WHOLE walk, not one per call. Each recursion
+        # used to start fresh, so a value reachable by more than one route was
+        # re-walked once per route: an address built from a flat index —
+        # `bhw` feeding both `bhw // W` and `bhw % W`, both feeding the same
+        # addptr — is a diamond, and diamonds compose. With ADD and MUL alone
+        # the fan-out stayed small enough not to show; widening the set to the
+        # whole integer family would have made the walk exponential in the
+        # depth of the address chain.
+        if visited is None:
+            visited = set()
         current = ssa_id
         while current not in visited:
             visited.add(current)
@@ -2627,11 +2673,14 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 if op.op == "tt.addptr" and len(op.operand_ids) >= 2:
                     current = op.operand_ids[1]
                     continue
-                # Arithmetic ops (muli, addi): the make_range could be either
+                # Integer arithmetic: the make_range could be in either
                 # operand (e.g. arange*SIZE or SIZE*arange). Try both.
-                if op.op in ("arith.muli", "arith.addi") and op.operand_ids:
+                if op.op in _TRACE_THROUGH_INT_ARITH and op.operand_ids:
                     for oid in op.operand_ids:
-                        result = self._trace_to_make_range(oid, ops, op_by_id)
+                        if oid in visited:
+                            continue
+                        result = self._trace_to_make_range(
+                            oid, ops, op_by_id, visited)
                         if result is not None:
                             return result
                     break
