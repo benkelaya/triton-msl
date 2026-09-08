@@ -342,6 +342,9 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # detection and read by the template. Initialised here so it can
         # never leak from one kernel into the next.
         self._k_loop_epilogue = None
+        # Set when the output store carries a mask that RESTRICTS the
+        # tile and can be re-emitted; read by the matmul templates.
+        self._template_store_mask_needed = False
         # FlashAttention zero-copy-dispatch descriptor. Set in the simdgroup-FA
         # branch of _lower_flash_attention_template; read by emit_msl into
         # metadata. Routes the 2-D-grid FA kernel through compile_shader (its

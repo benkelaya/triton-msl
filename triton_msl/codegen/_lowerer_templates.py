@@ -381,7 +381,13 @@ class _TemplateMixin:
         lines.append(f"        uint _ln = _e % {BLOCK_N}u;")
         lines.append("        uint m = row_base + _lm;")
         lines.append("        uint n = col_base + _ln;")
-        lines.append("        if (m >= _M || n >= _N) continue;")
+        _mask_expr_s = (self.detect_template_store_mask("m", "n")
+                        if getattr(self, "_template_store_mask_needed", False)
+                        else None)
+        if _mask_expr_s is None:
+            lines.append("        if (m >= _M || n >= _N) continue;")
+        else:
+            lines.append(f"        if (m >= _M || n >= _N || !({_mask_expr_s})) continue;")
         lines.append("        float _sum = 0.0f;")
         lines.append("        for (uint k = 0u; k < _K; k++) {")
         lines.append(f"            _sum += (float){a_name}[{_b_off['A']} + m * {a_rs} + k * {a_cs}]")
@@ -678,7 +684,16 @@ class _TemplateMixin:
         # sibling-divergence: the half/bfloat twin below already masked; this float
         # branch did not). So only take the fast path when fully aligned; otherwise
         # use the same masked per-simdgroup staged store (the cast is a no-op for float).
-        if output_msl_type == "float" and M % 32 == 0 and N % 32 == 0:
+        # The store's own mask, re-emitted over this template's global row and
+        # column. The direct path below writes a full unmasked 8x8, so it is
+        # disabled while a mask is present — otherwise the masked-off elements
+        # are clobbered, which is exactly the silent-wrong the refusal used to
+        # prevent (measured: all 1536 elements of rows >= BOUND written).
+        _mask_expr_sd = (self.detect_template_store_mask("gr", "gc")
+                         if getattr(self, "_template_store_mask_needed", False)
+                         else None)
+        if (output_msl_type == "float" and M % 32 == 0 and N % 32 == 0
+                and _mask_expr_sd is None):
             lines.append(f"        simdgroup_store(acc0, {c_name} + c_batch_off + (row_base) * N + col_base, N);")
             lines.append(f"        simdgroup_store(acc1, {c_name} + c_batch_off + (row_base + 8u) * N + col_base, N);")
             lines.append(f"        simdgroup_store(acc2, {c_name} + c_batch_off + (row_base + 16u) * N + col_base, N);")
@@ -703,7 +718,8 @@ class _TemplateMixin:
                     scratch="tg_out",
                     gr=f"row_base + {_n * 8}u + i / 8u",
                     gc="col_base + i % 8u",
-                    cond="gr < M && gc < N",
+                    cond=("gr < M && gc < N" if _mask_expr_sd is None
+                          else f"gr < M && gc < N && {_mask_expr_sd}"),
                     dst=f"{c_name}[c_batch_off + gr * N + gc]",
                     out_type=output_msl_type,
                     indent="        ",
@@ -742,6 +758,16 @@ class _TemplateMixin:
         # store the bare dot — the exact silent-wrong the epilogue refusal
         # existed to prevent. The staged path applies it per element.
         _epi = getattr(self, "_k_loop_epilogue", None)
+        # The store's own mask, re-emitted over this template's global row
+        # and column. When present, the two paths that write the tile
+        # UNMASKED are disabled exactly as they are for an epilogue: the
+        # direct fast path below, and the #159 two-kernel split whose
+        # standalone kernel the launcher dispatches for aligned shapes.
+        # Both would ignore the predicate, which is the silent-wrong the
+        # refusal existed to prevent.
+        _mask_expr = (self.detect_template_store_mask("gr", "gc")
+                      if getattr(self, "_template_store_mask_needed", False)
+                      else None)
         if _epi is not None and _epi.get("kind") != "col":
             # This template indexes the bias by the output COLUMN only. Any
             # other shape must not be silently dropped here — refuse, and let
@@ -991,7 +1017,7 @@ class _TemplateMixin:
         # register-blocking above it brings the same to real @triton.jit
         # matmuls. Partial/edge tiles (and half output) fall through to the
         # boundary-safe staged path below — direct simdgroup_load can't mask.
-        if output_msl_type == "float" and _epi is None:
+        if output_msl_type == "float" and _epi is None and _mask_expr is None:
             lines.append(f"    if (row_base + {BLOCK_M}u <= _M && col_base + {BLOCK_N}u <= _N && (_K % 8u) == 0u) {{")
             lines.append(f"        for (uint k = 0u; k < _K; k += 8u) {{")
             for c in range(col_tiles):
@@ -1080,6 +1106,8 @@ class _TemplateMixin:
                 g = _col_guard(c)
                 spfx = f"if ({g}) " if g else ""
                 cond = f"{g} && gr < _M && gc < _N" if g else "gr < _M && gc < _N"
+                if _mask_expr is not None:
+                    cond = f"{cond} && {_mask_expr}"
                 # store + write are per-simdgroup guarded; the barriers are NOT
                 # (every thread must reach them, regardless of which columns its
                 # simdgroup owns).
@@ -1117,6 +1145,7 @@ class _TemplateMixin:
         if (
             output_msl_type == "float"
             and _epi is None
+            and _mask_expr is None
             and has_M
             and has_N
             and has_K
@@ -1771,6 +1800,21 @@ class _TemplateMixin:
         the simdgroup tile (8) — currently ``min(M, 32)`` which handles
         the 64×64 and 128×128 test_dot softmax cases.
         """
+        if getattr(self, "_template_store_mask_needed", False):
+            # A restricting store mask was claimed as emittable, but THIS
+            # template does not evaluate it and writes the full tile. Dropping
+            # it would clobber the masked-off elements with finite values —
+            # the silent-wrong the refusal exists to prevent. Refuse instead;
+            # a template that can address the mask will take the kernel, or
+            # the caller keeps refusing.
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                "_lower_matmul_softmax_template cannot evaluate the store's output mask: it writes the "
+                "full computed tile. Refusing rather than clobber the "
+                "masked-off elements.",
+                op_name="tt.dot",
+            )
         M = info["M"]
         N = info["N"]
         K = info["K"]
@@ -2496,6 +2540,21 @@ class _TemplateMixin:
         For simple 3-pointer kernels (A, B, C with no strides), falls back
         to the optimized simdgroup_matrix template.
         """
+        if getattr(self, "_template_store_mask_needed", False):
+            # A restricting store mask was claimed as emittable, but THIS
+            # template does not evaluate it and writes the full tile. Dropping
+            # it would clobber the masked-off elements with finite values —
+            # the silent-wrong the refusal exists to prevent. Refuse instead;
+            # a template that can address the mask will take the kernel, or
+            # the caller keeps refusing.
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                "_lower_dot_via_prebuilt_template cannot evaluate the store's output mask: it writes the "
+                "full computed tile. Refusing rather than clobber the "
+                "masked-off elements.",
+                op_name="tt.dot",
+            )
         # STRUCTURAL REFUSAL (matmul unification): this template models EXACTLY ONE 2-D
         # matmul. A multi-tt.dot kernel (chain-dot (A@B)@W) or a rank>=3 (batched/3-D) dot
         # has no correct lowering here — the simple-template branch silently computes a

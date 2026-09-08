@@ -837,6 +837,192 @@ class _DetectionMixin:
         _walk_mask(stores[0].operand_ids[2])
         return {k: v for k, v in out.items() if v}
 
+
+    # ------------------------------------------------------------------
+    # Threading a store MASK into a matmul template.
+    #
+    # The templates compute the full output tile and gate writes only on the
+    # tile boundary, so a tighter mask was refused wholesale — including the
+    # ordinary case of a convolution, whose mask is an AND of four bounds on
+    # the DECOMPOSED row index (batch, out_h, out_w) plus one on the column.
+    # Nothing about that is unlowerable: the mask is an expression over the
+    # tile indices and kernel scalars, and a template that knows the global
+    # row/column of the element it is about to write can evaluate it.
+    #
+    # `_emit_mask_expr` re-emits that expression in MSL over the template's own
+    # index variables. It is deliberately an ALLOWLIST of node kinds: anything
+    # it does not recognise returns None and the caller keeps refusing, so a
+    # mask this cannot reproduce is never silently dropped.
+    # ------------------------------------------------------------------
+
+    _CMPI_PREDICATE = {
+        "0": "==", "1": "!=", "2": "<", "3": "<=", "4": ">", "5": ">=",
+        "6": "<", "7": "<=", "8": ">", "9": ">=",
+        "eq": "==", "ne": "!=", "slt": "<", "sle": "<=", "sgt": ">",
+        "sge": ">=", "ult": "<", "ule": "<=", "ugt": ">", "uge": ">=",
+    }
+    _MASK_BINOPS = {
+        "arith.addi": "+", "arith.subi": "-", "arith.muli": "*",
+        "arith.divsi": "/", "arith.remsi": "%", "arith.divui": "/",
+        "arith.remui": "%",
+    }
+    _MASK_PASSTHROUGH = ("tt.broadcast", "ttg.convert_layout", "tt.reshape",
+                         "arith.extsi", "arith.trunci", "arith.index_cast")
+
+    def _emit_mask_expr(self, vid, row_var, col_var, by_id, scalar_args,
+                        axis=None, depth=0):
+        """The store mask as an MSL expression over ``row_var`` / ``col_var``.
+
+        ``axis`` carries the enclosing ``tt.expand_dims`` axis, which is what
+        says whether a ``tt.make_range`` underneath is the ROW index (expanded
+        on axis 1, ``[:, None]``) or the COLUMN index (axis 0, ``[None, :]``).
+        Returns None for anything outside the allowlist.
+        """
+        if depth > 24:
+            return None
+        # A kernel ARGUMENT is a value with no producing op, so it has to be
+        # resolved before the op lookup — otherwise every bound in the mask
+        # (out_height, out_width, ...) reads as unknown.
+        if vid in scalar_args:
+            return scalar_args[vid]
+        o = by_id.get(vid)
+        if o is None:
+            return None
+
+        if o.op in self._MASK_PASSTHROUGH:
+            if not o.operand_ids:
+                return None
+            return self._emit_mask_expr(o.operand_ids[0], row_var, col_var,
+                                        by_id, scalar_args, axis, depth + 1)
+
+        if o.op == "tt.expand_dims":
+            if not o.operand_ids:
+                return None
+            return self._emit_mask_expr(o.operand_ids[0], row_var, col_var,
+                                        by_id, scalar_args,
+                                        str(o.attrs.get("axis")), depth + 1)
+
+        if o.op == "tt.splat":
+            if not o.operand_ids:
+                return None
+            return self._emit_mask_expr(o.operand_ids[0], row_var, col_var,
+                                        by_id, scalar_args, axis, depth + 1)
+
+        if o.op == "tt.make_range":
+            # axis 1 == [:, None] == the row index; axis 0 == [None, :] == the
+            # column. Without an enclosing expand_dims the mask is 1-D and the
+            # axis is not determined, so refuse rather than guess.
+            if axis == "1":
+                return row_var
+            if axis == "0":
+                return col_var
+            return None
+
+        if o.op == "arith.constant":
+            v = o.attrs.get("value")
+            try:
+                return f"({int(str(v).strip())})"
+            except (TypeError, ValueError):
+                return None
+
+        if o.op in ("tt.get_program_id", "tt.get_num_programs"):
+            # The template owns the grid: a kernel's own tile arithmetic is not
+            # its arithmetic, so a mask that reads the program id directly
+            # cannot be reproduced here.
+            return None
+
+        if o.op == "arith.andi" and len(o.operand_ids or []) == 2:
+            a = self._emit_mask_expr(o.operand_ids[0], row_var, col_var, by_id,
+                                     scalar_args, axis, depth + 1)
+            b = self._emit_mask_expr(o.operand_ids[1], row_var, col_var, by_id,
+                                     scalar_args, axis, depth + 1)
+            return None if a is None or b is None else f"({a} && {b})"
+
+        if o.op == "arith.ori" and len(o.operand_ids or []) == 2:
+            a = self._emit_mask_expr(o.operand_ids[0], row_var, col_var, by_id,
+                                     scalar_args, axis, depth + 1)
+            b = self._emit_mask_expr(o.operand_ids[1], row_var, col_var, by_id,
+                                     scalar_args, axis, depth + 1)
+            return None if a is None or b is None else f"({a} || {b})"
+
+        if o.op == "arith.cmpi" and len(o.operand_ids or []) == 2:
+            pred = self._CMPI_PREDICATE.get(str(o.attrs.get("predicate")))
+            if pred is None:
+                return None
+            a = self._emit_mask_expr(o.operand_ids[0], row_var, col_var, by_id,
+                                     scalar_args, axis, depth + 1)
+            b = self._emit_mask_expr(o.operand_ids[1], row_var, col_var, by_id,
+                                     scalar_args, axis, depth + 1)
+            return None if a is None or b is None else f"((int){a} {pred} (int){b})"
+
+        if o.op in self._MASK_BINOPS and len(o.operand_ids or []) == 2:
+            # `pid * BLOCK + make_range` IS the template's own global index:
+            # emit that index once rather than adding the kernel's tile offset
+            # to it a second time.
+            if o.op == "arith.addi":
+                for j in (0, 1):
+                    other = by_id.get(o.operand_ids[1 - j])
+                    inner = other
+                    hops = 0
+                    while (inner is not None and inner.op in
+                           ("tt.splat",) + self._MASK_PASSTHROUGH
+                           and inner.operand_ids and hops < 6):
+                        inner = by_id.get(inner.operand_ids[0])
+                        hops += 1
+                    base = self._emit_mask_expr(o.operand_ids[j], row_var,
+                                                col_var, by_id, scalar_args,
+                                                axis, depth + 1)
+                    if base in (row_var, col_var) and inner is not None and \
+                            self._expr_reads_program_id(inner.id, by_id):
+                        return base
+            a = self._emit_mask_expr(o.operand_ids[0], row_var, col_var, by_id,
+                                     scalar_args, axis, depth + 1)
+            b = self._emit_mask_expr(o.operand_ids[1], row_var, col_var, by_id,
+                                     scalar_args, axis, depth + 1)
+            if a is None or b is None:
+                return None
+            return f"((int){a} {self._MASK_BINOPS[o.op]} (int){b})"
+
+        return None
+
+    def _expr_reads_program_id(self, vid, by_id, depth=0, seen=None):
+        """True when a value's chain reaches ``tt.get_program_id``."""
+        seen = seen if seen is not None else set()
+        if vid in seen or depth > 12:
+            return False
+        seen.add(vid)
+        o = by_id.get(vid)
+        if o is None:
+            return False
+        if o.op in ("tt.get_program_id", "tt.program_id"):
+            return True
+        return any(self._expr_reads_program_id(c, by_id, depth + 1, seen)
+                   for c in (o.operand_ids or []))
+
+    def detect_template_store_mask(self, row_var, col_var):
+        """The output store's mask as an MSL expression, or None.
+
+        None means the mask is absent, trivial, or outside the allowlist — the
+        caller then behaves exactly as before.
+        """
+        def _flat(ops):
+            for x in ops:
+                yield x
+                if x.region_ops:
+                    yield from _flat(x.region_ops)
+                if x.else_ops:
+                    yield from _flat(x.else_ops)
+
+        allops = list(_flat(self.graph.ops))
+        by_id = {o.id: o for o in allops}
+        stores = [o for o in self.graph.ops if o.op == "tt.store"]
+        if len(stores) != 1 or len(stores[0].operand_ids or []) < 3:
+            return None
+        scalar_args = {a.id: a.name for a in self.graph.args
+                       if not getattr(a, "is_ptr", False)}
+        return self._emit_mask_expr(stores[0].operand_ids[2], row_var, col_var,
+                                    by_id, scalar_args)
+
     def _template_output_mask_nontrivial(self, is_fa, ok_row_args=None,
                                          ok_row_consts=None, ok_col_consts=None):
         """True iff a dot-bearing kernel carries an output ``tt.store`` mask that
@@ -1127,6 +1313,20 @@ class _DetectionMixin:
                 ok_col_consts={_dim_consts["N"]} if "N" in _dim_consts else None):
             from triton_msl.errors import MetalNonRecoverableError
 
+            # A mask the template can EVALUATE is not a mask it would drop.
+            # `detect_template_store_mask` re-emits the store's own predicate
+            # over the template's global row/column, so the ordinary case — a
+            # convolution bounding the decomposed (batch, out_h, out_w) of its
+            # flattened row, plus the output feature on the column — is
+            # computed rather than refused. Anything the allowlist cannot
+            # reproduce still returns None here and still refuses.
+            if self.detect_template_store_mask("gr", "gc") is not None:
+                # Emittable AND restricting: the template will evaluate it.
+                # The flag is what the templates read, so a TRIVIAL mask — the
+                # tile-boundary clip every ordinary matmul carries — never
+                # reaches this point and their lowering is untouched.
+                self._template_store_mask_needed = True
+                return
             raise MetalNonRecoverableError(
                 "matmul with a non-tile-boundary output store mask is not supported: "
                 "the simdgroup / K-loop / strided / matmul+softmax templates compute the "

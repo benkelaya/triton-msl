@@ -877,18 +877,34 @@ def test_size1_1d_atomic_not_overcounted():
 
 
 @requires
-def test_matmul_nontileboundary_output_mask_refuses_not_clobber():
-    # The matmul/FA templates compute the full tile and gate writes only on the tile
-    # boundary, silently DROPPING a tighter user output mask -> masked rows clobbered.
-    # A non-tile-boundary mask must refuse loudly. (mask-store/twin hunt 2026-06-27)
+def test_matmul_nontileboundary_output_mask_is_honored_not_clobbered():
+    """A tighter output mask must be EVALUATED, not dropped and not refused.
+
+    The templates compute the full tile and used to gate writes only on the
+    tile boundary, so a mask like ``rm < BOUND`` with BOUND < M was silently
+    dropped and the masked-off rows were clobbered with finite values. That
+    was refused wholesale. The store's predicate is now re-emitted over the
+    template's own global row/column, so the kernel computes: what this test
+    pins is the OUTCOME the refusal was protecting — the masked rows are
+    untouched and the written rows are right.
+
+    A template that cannot evaluate the mask still refuses (it raises rather
+    than write the full tile), so the protection is intact where it is needed.
+    """
     _clear()
     M, N, K, BOUND = 64, 64, 64, 40
-    A = torch.randn(M, K, device="mps")
-    B = torch.randn(K, N, device="mps")
+    An = np.random.RandomState(0).randn(M, K).astype(np.float32)
+    Bn = np.random.RandomState(1).randn(K, N).astype(np.float32)
+    A = torch.tensor(An, device="mps")
+    B = torch.tensor(Bn, device="mps")
     O = torch.zeros(M, N, device="mps")
-    with pytest.raises(MetalNonRecoverableError):
-        _k_mm_boundmask[(1,)](A, B, O, M=M, N=N, K=K, BOUND=BOUND)
-        torch.mps.synchronize()
+    _k_mm_boundmask[(1,)](A, B, O, M=M, N=N, K=K, BOUND=BOUND)
+    torch.mps.synchronize()
+    got = O.cpu().numpy()
+    ref = An.astype(np.float64) @ Bn.astype(np.float64)
+    assert float(np.abs(got[:BOUND] - ref[:BOUND]).max()) < 1e-3, "written rows wrong"
+    assert int((got[BOUND:] != 0).sum()) == 0, (
+        f"{int((got[BOUND:] != 0).sum())} masked-off elements were clobbered")
 
 
 @requires
