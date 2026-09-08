@@ -7954,7 +7954,24 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
                 self.kb.raw_line(f"        {shared_name}[_sa] = {src_var};")
                 self.kb.raw_line(f"    }}")
-        elif src_ptr_name:
+        elif src_ptr_name or (self._needs_wrapping and self._is_2d
+                              and load_ptr_info is not None):
+            # `src_ptr_name` is traced over self.graph.ops, the TOP LEVEL
+            # only, so a load inside an scf.for region leaves it None and the
+            # else-branch below stages `src_var` — a value computed in the
+            # per-element loop. Under wrapping that loop is closed before the
+            # staging is emitted, so the MSL references an out-of-scope
+            # identifier (`use of undeclared identifier 'val_66'`), which is
+            # what blocks every convolution in the upscaler family.
+            #
+            # `load_ptr_info` is traced over the REGION-CROSSING op list and
+            # does find it, and the branch below already knows how to rebuild
+            # the global address from (_fill_row, _fill_col) and read the
+            # operand directly. That path needs nothing from the loop, so it
+            # has no scope problem to solve.
+            #
+            # Restricted to the wrapped case on purpose: where the value is in
+            # scope the existing staging is correct and stays untouched.
             if self._is_2d and load_ptr_info is not None:
                 # 2-D tile staged for a tt.dot but small enough that
                 # total <= block_size. The flat base_ptr[_sa] copy assumes a
