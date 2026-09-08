@@ -7721,6 +7721,104 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             _refuse()
         _refuse()
 
+    # MLIR integer ops this emitter can write directly as MSL, with the
+    # operator to use. Division and remainder are the point of it: an im2col
+    # address recovers (h, w) from a flat index with `/` and `%`, and a
+    # modulo of an index is piecewise, so it has no affine form at all and
+    # the (row/col, stride) decomposition cannot express it in principle.
+    _REEMIT_BINOPS = {
+        "arith.addi": "+", "arith.subi": "-", "arith.muli": "*",
+        "arith.divsi": "/", "arith.divui": "/",
+        "arith.remsi": "%", "arith.remui": "%",
+        "arith.andi": "&", "arith.ori": "|", "arith.xori": "^",
+        "arith.shli": "<<", "arith.shrsi": ">>", "arith.shrui": ">>",
+        "arith.minsi": None, "arith.maxsi": None,  # emitted as min()/max()
+    }
+    _REEMIT_PASS = (
+        "arith.index_cast", "arith.index_castui",
+        "arith.extsi", "arith.extui", "arith.trunci",
+        "tt.broadcast",
+    )
+
+    def _reemit_staged_fill_expr(self, nid, axis_dim, op_by_id, M, N, depth=0):
+        """Re-emit one offset expression as MSL over (_fill_row, _fill_col).
+
+        The affine decomposition in ``_staged_fill_terms`` reduces a term to
+        ``coeff * index + const``. That is the right shape for a matmul and
+        the wrong shape for a convolution, whose operand address divides and
+        takes remainders of a flat index. Rather than widen an algebra that
+        cannot hold a modulo, this walks the same tree and WRITES it, with
+        each ``tt.make_range`` replaced by the fill coordinate its enclosing
+        ``tt.expand_dims`` fixes.
+
+        Correct-or-refuse is preserved exactly: a ``make_range`` whose extent
+        does not match the staged dimension refuses, an unresolvable leaf
+        returns None, and an op with no MSL spelling returns None. Nothing is
+        guessed — the caller refuses on None as it always did.
+        """
+        if depth > 64:
+            self._staged_fill_blocker = "recursion depth > 64 (re-emit)"
+            return None
+        op = op_by_id.get(nid)
+        if op is None:
+            ev = self.env.get(nid)
+            return f"(int)({ev})" if isinstance(ev, str) and ev else None
+        name = op.op
+
+        if name == "tt.make_range":
+            if axis_dim is None:
+                self._staged_fill_blocker = "make_range with no enclosing expand_dims"
+                return None
+            start = int(op.attrs.get("start", 0))
+            extent = int(op.attrs.get("end", 0)) - start
+            want = M if axis_dim == 0 else N
+            if extent != want:
+                # Same guard the affine path applies: a range whose extent is
+                # not the staged dimension would mis-stage the tile.
+                self._staged_fill_blocker = (
+                    f"make_range extent {extent} != staged dim {want}")
+                return None
+            idx = "(int)_fill_row" if axis_dim == 0 else "(int)_fill_col"
+            return idx if start == 0 else f"({start} + {idx})"
+
+        if name == "tt.expand_dims":
+            axis = int(op.attrs.get("axis", 0))
+            d = 1 - axis
+            if d not in (0, 1) or not op.operand_ids:
+                return None
+            if axis_dim is not None and axis_dim != d:
+                return None
+            return self._reemit_staged_fill_expr(
+                op.operand_ids[0], d, op_by_id, M, N, depth + 1)
+
+        if name in self._REEMIT_PASS:
+            if not op.operand_ids:
+                return None
+            return self._reemit_staged_fill_expr(
+                op.operand_ids[0], axis_dim, op_by_id, M, N, depth + 1)
+
+        if name in ("tt.splat", "arith.constant"):
+            ev = self.env.get(nid)
+            return f"(int)({ev})" if isinstance(ev, str) and ev else None
+
+        if name in self._REEMIT_BINOPS:
+            if len(op.operand_ids or []) < 2:
+                return None
+            a = self._reemit_staged_fill_expr(
+                op.operand_ids[0], axis_dim, op_by_id, M, N, depth + 1)
+            b = self._reemit_staged_fill_expr(
+                op.operand_ids[1], axis_dim, op_by_id, M, N, depth + 1)
+            if a is None or b is None:
+                return None
+            sym = self._REEMIT_BINOPS[name]
+            if sym is None:
+                fn = "min" if name == "arith.minsi" else "max"
+                return f"{fn}({a}, {b})"
+            return f"({a} {sym} {b})"
+
+        self._staged_fill_blocker = f"{name} (re-emit)"
+        return None
+
     def _rebuild_staged_fill_offset(self, addptr_id, op_by_id, base_ptr, M, N):
         """Per-load structural rebuild of a shared-memory-staged tt.dot
         operand's global address as a function of (_fill_row, _fill_col).
@@ -7799,7 +7897,24 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             if op.op == "tt.addptr":
                 if len(op.operand_ids) < 2:
                     break
-                _add(self._staged_fill_terms(op.operand_ids[1], None, None, op_by_id))
+                _term_id = op.operand_ids[1]
+                _sub = self._staged_fill_terms(_term_id, None, None, op_by_id)
+                if _sub is None:
+                    # The affine decomposition cannot hold this term. Before
+                    # refusing, try WRITING it: an im2col address divides and
+                    # takes remainders of a flat index, which has no affine
+                    # form at any width, so no term table reaches it. The
+                    # re-emitter keeps the same leaf checks — a make_range
+                    # whose extent is not the staged dimension still refuses —
+                    # so this widens what can be expressed, not what is
+                    # guessed.
+                    _re = self._reemit_staged_fill_expr(
+                        _term_id, None, op_by_id, M, N)
+                    if _re is None:
+                        _refuse()
+                    parts.append(_re)
+                else:
+                    _add(_sub)
                 cur = op.operand_ids[0]
                 continue
             if op.op == "tt.broadcast" and op.operand_ids:
