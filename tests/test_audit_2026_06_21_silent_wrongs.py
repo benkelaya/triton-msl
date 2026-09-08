@@ -336,7 +336,14 @@ def test_reduce_plus_cooperative_op_over_threadgroup_refuses():
     # tile > num_threads took the multipass-reduce dispatch, which under-computes the
     # cooperative op's one-element-per-thread staging (scan+reduce gave 33024 vs 131328;
     # histogram re-counted each bin num_warps times). Must refuse loudly.
-    N = 512
+    #
+    # The tile that MATTERS is one that exceeds the 1024-thread threadgroup. A
+    # tile at or below it is now dispatched one thread per element instead of
+    # being refused (the layout's warpsPerCTA is a scheduling choice, not a
+    # hardware limit); test_reduce_plus_cooperative_op_at_threadgroup_computes
+    # below pins the numbers for those. This test keeps the case where one
+    # thread per element is impossible.
+    N = 2048
     a = torch.ones(N, device="mps")
     o = torch.empty(1, device="mps")
     with pytest.raises(MetalNonRecoverableError):
@@ -347,6 +354,33 @@ def test_reduce_plus_cooperative_op_over_threadgroup_refuses():
     with pytest.raises(MetalNonRecoverableError):
         _hist_then_reduce[(1,)](ai, oi, N=N, B=16)
         torch.mps.synchronize()
+
+
+@requires
+@pytest.mark.parametrize("N", [512, 1024])
+def test_reduce_plus_cooperative_op_at_threadgroup_computes(N):
+    """A tile the threadgroup CAN hold must compute, not refuse.
+
+    These are the sizes the refusal above used to cover. 33024 was the
+    silently-wrong scan+reduce the audit found; the correct value is
+    N*(N+1)/2, and the histogram of N zeros into any bin count totals N.
+    """
+    a = torch.ones(N, device="mps")
+    o = torch.empty(1, device="mps")
+    _scan_then_reduce[(1,)](a, o, N=N)
+    torch.mps.synchronize()
+    assert float(o.cpu()[0]) == N * (N + 1) / 2, (
+        f"scan+reduce over {N} elements: got {float(o.cpu()[0])}, "
+        f"want {N * (N + 1) / 2}"
+    )
+
+    ai = torch.zeros(N, device="mps", dtype=torch.int32)
+    oi = torch.empty(1, device="mps", dtype=torch.int32)
+    _hist_then_reduce[(1,)](ai, oi, N=N, B=16)
+    torch.mps.synchronize()
+    assert int(oi.cpu()[0]) == N, (
+        f"histogram+reduce over {N} elements: got {int(oi.cpu()[0])}, want {N}"
+    )
 
 
 @requires

@@ -24,6 +24,26 @@ from triton_msl.codegen.msl_types import triton_type_to_msl
 from triton_msl.codegen._lowerer_helpers import _mlir_to_triton_dtype
 
 
+
+def _scan_combine_is_float_add(ssa, msl_type, n_values):
+    """True when the scan's combine region is exactly one float add.
+
+    ``tt.scan`` carries an arbitrary combine region, so the emitter may not
+    assume addition: ``tl.cummax`` and ``tl.associative_scan`` with a user
+    function come through the same path. Compensated accumulation is valid
+    only for a floating-point sum, so the region is checked exactly — one
+    ``arith.addf`` whose result is what ``tt.scan.return`` yields — and
+    anything else keeps the plain accumulator.
+    """
+    if msl_type not in ("float", "half") or n_values != 1:
+        return False
+    body = [o for o in (ssa.region_ops or []) if o.op != "tt.scan.return"]
+    rets = [o for o in (ssa.region_ops or []) if o.op == "tt.scan.return"]
+    if len(body) != 1 or body[0].op != "arith.addf" or len(rets) != 1:
+        return False
+    return list(rets[0].operand_ids or []) == [body[0].id]
+
+
 class _ReduceScanMixin:
     """``tt.reduce`` and ``tt.scan`` lowering for ``GenericLowerer``."""
 
@@ -2534,6 +2554,18 @@ class _ReduceScanMixin:
             pos_expr = f"(lid / {N}u)"
             # For axis=0, elements in same column are at stride N
 
+        # A per-thread prefix sum re-adds the whole prefix in the naive
+        # left-to-right order — the same order the fp64 oracle uses — so the
+        # only thing separating this result from the correctly-rounded one is
+        # the rounding of the running fp32 partial. Compensating that partial
+        # (Neumaier) makes the narrow output round the way the oracle rounds:
+        # cumsum over a 1024-wide fp16 row was 1 ULP where CUDA was 0, on 3
+        # elements of 3072, each a near-tie the uncompensated partial pushed
+        # the wrong way. Only a plain float sum is compensated; every other
+        # combine keeps the accumulator it had.
+        _compensate = _scan_combine_is_float_add(ssa, msl_type, n_values)
+        comp_vars = []
+
         # Initialize accumulators with first element of scan group
         acc_vars = []
         for i in range(n_values):
@@ -2550,6 +2582,10 @@ class _ReduceScanMixin:
                 else:
                     init_idx = f"({(M - 1)}u * {N}u + (lid % {N}u))"
             self.kb.raw_line(f"    {msl_type} {acc_var} = ({msl_type}){shared_names[i]}[{init_idx}];")
+            if _compensate:
+                comp_var = self._next_var("scan_comp")
+                comp_vars.append(comp_var)
+                self.kb.raw_line(f"    {msl_type} {comp_var} = ({msl_type})0;")
 
         # Emit scan loop
         if not reverse:
@@ -2593,12 +2629,29 @@ class _ReduceScanMixin:
                     self._lower_op(body_op)
 
         # Update accumulators from combine results
-        for i in range(n_values):
-            if i < len(scan_return_ids):
-                new_val = self._lookup(scan_return_ids[i])
-                self.kb.raw_line(f"        {acc_vars[i]} = {new_val};")
+        if _compensate:
+            # Neumaier: keep the part of each addition the accumulator cannot
+            # hold, in the branch that is correct whichever operand is larger.
+            # Under fast-math the compiler may fold the compensation away, in
+            # which case this degrades exactly to the plain sum below — never
+            # to something worse.
+            acc, comp, rhs = acc_vars[0], comp_vars[0], rhs_vars[0]
+            t_var = self._next_var("scan_t")
+            self.kb.raw_line(f"        {msl_type} {t_var} = {acc} + {rhs};")
+            self.kb.raw_line(
+                f"        {comp} += (fabs({acc}) >= fabs({rhs})) "
+                f"? (({acc} - {t_var}) + {rhs}) : (({rhs} - {t_var}) + {acc});")
+            self.kb.raw_line(f"        {acc} = {t_var};")
+        else:
+            for i in range(n_values):
+                if i < len(scan_return_ids):
+                    new_val = self._lookup(scan_return_ids[i])
+                    self.kb.raw_line(f"        {acc_vars[i]} = {new_val};")
 
         self.kb.raw_line(f"    }}")
+        if _compensate:
+            # Fold the carried compensation in once, after the loop.
+            self.kb.raw_line(f"    {acc_vars[0]} = {acc_vars[0]} + {comp_vars[0]};")
 
         # Trailing barrier: every thread must finish READING the scan_shared buffer
         # in the loop above before any thread REUSES it. This is critical when the

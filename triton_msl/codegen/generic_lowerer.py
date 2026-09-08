@@ -1689,20 +1689,45 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 block_size = num_threads
                 self._mept_single_pass = True
             elif has_reduce_ops:
-                if _coop_staging_ops:
+                if _coop_staging_ops and block_size <= 1024:
+                    # A cooperative op needs one thread per element, and here
+                    # the tile FITS in a threadgroup — so dispatch one thread
+                    # per element instead of refusing. ``num_threads`` came
+                    # from the layout's warpsPerCTA (a scheduling choice), not
+                    # from any hardware limit; the 1024 ceiling is the limit,
+                    # and this tile is under it. The reduce then takes the
+                    # ordinary one-element-per-thread path, which is what it
+                    # would have taken had the layout picked more warps.
+                    #
+                    # The refusal below told the caller to "use BLOCK <=
+                    # num_threads" — advice the lowerer can follow itself,
+                    # since it decides the dispatch. It stays for the tiles
+                    # that genuinely exceed the threadgroup, where one thread
+                    # per element is impossible and a scan needs a real
+                    # multi-block algorithm (cumsum over 2048 and 4096 tiles).
+                    #
+                    # The emitter derives its simdgroup count from block_size
+                    # ((block_size + 31) // 32), and the driver dispatches
+                    # metadata.block_size threads and refuses loudly if the
+                    # pipeline cannot hold them, so raising it is consistent
+                    # end to end.
+                    num_threads = block_size
+                elif _coop_staging_ops:
                     raise MetalNonRecoverableError(
                         "Kernel combines a reduce with a cooperative shared-memory "
                         "op (scan/transpose/gather/cat/join/split/histogram) over a "
-                        "tile wider than the threadgroup: the multipass reduce "
-                        "dispatches only num_threads threads while the cooperative op "
-                        "stages one element per thread, so the staging tail is "
-                        "under-computed (silent-wrong). Split into separate kernels "
-                        "or use BLOCK <= num_threads.",
+                        f"{block_size}-element tile that exceeds the 1024-thread "
+                        "threadgroup: the multipass reduce dispatches only "
+                        "num_threads threads while the cooperative op stages one "
+                        "element per thread, so the staging tail is under-computed "
+                        "(silent-wrong). A tile this wide needs a multi-block scan; "
+                        "split into separate kernels or use BLOCK <= 1024.",
                         op_name="tt.reduce",
                     )
-                use_multipass = True
-                self._total_elements = block_size
-                block_size = num_threads
+                else:
+                    use_multipass = True
+                    self._total_elements = block_size
+                    block_size = num_threads
             elif mept_kernel_safe and not has_barrier_ops and num_threads * size_per_thread == block_size:
                 # Phase 4c MEPT single-pass: each of ``num_threads`` threads
                 # owns ``size_per_thread`` contiguous elements via a register
