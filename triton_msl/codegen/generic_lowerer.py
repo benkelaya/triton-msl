@@ -342,6 +342,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # detection and read by the template. Initialised here so it can
         # never leak from one kernel into the next.
         self._k_loop_epilogue = None
+        self._wide_scan = False
+        self._wide_scan_bindings = {}
         # Set when the output store carries a mask that RESTRICTS the
         # tile and can be re-emitted; read by the matmul templates.
         self._template_store_mask_needed = False
@@ -708,6 +710,50 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
 
     # -- Multi-pass reduction helpers ------------------------------------------
 
+    def _wide_scan_eligible(self, all_ops, block_size):
+        """None when this kernel's cooperative op can take the chunked wide
+        scan; otherwise the reason it cannot, phrased for the refusal.
+
+        The chunked path replaces one-thread-per-element with one CONTIGUOUS
+        RANGE per thread, which only a scan can use — a transpose, gather,
+        cat, join, split or histogram stages by a different rule and would be
+        silently wrong under it. So the whole cooperative set has to be a
+        single scan, it has to cover exactly this tile (the result is read
+        back at the wrap loop's element index, which runs to the tile's
+        width), and its combine has to decompose.
+        """
+        from triton_msl.codegen._lowerer_reduce import wide_scan_refusal
+
+        coop = [o for o in all_ops if o.op in (
+            "tt.scan", "tt.trans", "tt.gather", "tt.cat", "tt.join",
+            "tt.split", "tt.histogram")]
+        if len(coop) != 1 or coop[0].op != "tt.scan":
+            names = ", ".join(sorted({o.op for o in coop})) or "none"
+            return (f"only a single tt.scan can take the chunked wide path; "
+                    f"this kernel's cooperative ops are: {names}")
+        scan = coop[0]
+        # The phase splitter walks the TOP LEVEL only, so a scan inside an
+        # scf.for / scf.if region never becomes a boundary and would fall
+        # through to the one-element-per-thread lowering — which refuses at
+        # this width anyway, but for a reason that has nothing to do with why
+        # the chunked path declined. Say the real reason here.
+        if not any(o is scan for o in self.graph.ops):
+            return ("the scan is inside a region (scf.for / scf.if), and the "
+                    "chunked path is emitted as a top-level phase so its "
+                    "barriers stay out of every loop")
+        shape = _extract_shape(scan.type_str)
+        if not shape and scan.operand_ids:
+            shape = _extract_shape(self._find_op_type_str(scan.operand_ids[0]))
+        numel = 1
+        for d in (shape or ()):
+            numel *= d
+        if not shape or numel != block_size:
+            return (f"the scan covers {numel or 'an unknown number of'} elements "
+                    f"but the tile is {block_size}; the chunked path reads the "
+                    f"result back at the wrap loop's element index, so the two "
+                    f"must be the same width")
+        return wide_scan_refusal(scan, len(scan.operand_ids), numel, 1024)
+
     def _split_ops_by_reductions(self):
         """Split ops into phases separated by tt.reduce ops.
 
@@ -715,10 +761,16 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         isolated in their own single-element phases so they can be emitted
         between per-element loops.
         """
+        # A scan WIDER than the threadgroup is a phase boundary for the same
+        # reason a reduce is: it stages the whole tile through threadgroup
+        # memory behind barriers, and a barrier inside the per-element wrap
+        # loop is undefined. It splits only in that regime — a scan that fits
+        # one thread per element stays an ordinary in-loop op.
+        _boundary_ops = ("tt.reduce", "tt.scan") if getattr(self, "_wide_scan", False) else ("tt.reduce",)
         phases = []
         current_phase = []
         for ssa in self.graph.ops:
-            if ssa.op == "tt.reduce":
+            if ssa.op in _boundary_ops:
                 if current_phase:
                     phases.append((current_phase, False))
                 phases.append(([ssa], True))
@@ -727,6 +779,19 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 current_phase.append(ssa)
         if current_phase:
             phases.append((current_phase, False))
+
+        # Two boundaries back to back (scan then reduce, as tl.cumsum(x) +
+        # tl.sum(x) produces) would leave the second with no per-element loop
+        # to build its accumulator in — its input variable died with the
+        # previous loop's scope. An EMPTY per-element phase between them is
+        # given one by the emitter, which replays the dependencies it needs.
+        if len(_boundary_ops) > 1:
+            spaced = []
+            for phase in phases:
+                if phase[1] and spaced and spaced[-1][1]:
+                    spaced.append(([], False))
+                spaced.append(phase)
+            phases = spaced
         return phases
 
     def _collect_tensor_deps(self, target_ops, all_preceding_ops, reduce_result_ids):
@@ -1728,10 +1793,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     #
                     # The refusal below told the caller to "use BLOCK <=
                     # num_threads" — advice the lowerer can follow itself,
-                    # since it decides the dispatch. It stays for the tiles
-                    # that genuinely exceed the threadgroup, where one thread
-                    # per element is impossible and a scan needs a real
-                    # multi-block algorithm (cumsum over 2048 and 4096 tiles).
+                    # since it decides the dispatch. Above the threadgroup one
+                    # thread per element is impossible, and the tile is then
+                    # decomposed instead: see the chunked wide-scan branch
+                    # below, which serves the 2048 and 4096 cumsum tiles. The
+                    # refusal stays for every cooperative op that does not
+                    # decompose that way.
                     #
                     # The emitter derives its simdgroup count from block_size
                     # ((block_size + 31) // 32), and the driver dispatches
@@ -1739,6 +1806,19 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     # pipeline cannot hold them, so raising it is consistent
                     # end to end.
                     num_threads = block_size
+                elif _coop_staging_ops and self._wide_scan_eligible(all_ops_iter, block_size) is None:
+                    # The cooperative op is a single plain-add scan covering
+                    # exactly this tile: it takes the chunked wide-scan path,
+                    # where each thread owns a CONTIGUOUS range of the tile
+                    # instead of a single element. The scan becomes a phase
+                    # boundary (like the reduce) so its barriers stay out of
+                    # the per-element loop, and 1024 threads are dispatched —
+                    # the ceiling, since the chunk count is what the tile is
+                    # divided by.
+                    self._wide_scan = True
+                    use_multipass = True
+                    self._total_elements = block_size
+                    block_size = 1024
                 elif _coop_staging_ops:
                     raise MetalNonRecoverableError(
                         "Kernel combines a reduce with a cooperative shared-memory "
@@ -1747,8 +1827,9 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                         "threadgroup: the multipass reduce dispatches only "
                         "num_threads threads while the cooperative op stages one "
                         "element per thread, so the staging tail is under-computed "
-                        "(silent-wrong). A tile this wide needs a multi-block scan; "
-                        "split into separate kernels or use BLOCK <= 1024.",
+                        "(silent-wrong). "
+                        f"{self._wide_scan_eligible(all_ops_iter, block_size)}. "
+                        "Split into separate kernels or use BLOCK <= 1024.",
                         op_name="tt.reduce",
                     )
                 else:
@@ -1776,13 +1857,20 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 block_size = num_threads
         elif block_size > 1024:
             if has_reduce_ops:
-                if _coop_staging_ops:
+                if _coop_staging_ops and self._wide_scan_eligible(all_ops_iter, block_size) is None:
+                    # A single plain-add scan covering exactly this tile takes
+                    # the chunked wide path; the multipass tail below is the
+                    # same for both, so only the flag differs here.
+                    self._wide_scan = True
+                elif _coop_staging_ops:
                     raise MetalNonRecoverableError(
                         "Kernel combines a reduce with a cooperative shared-memory "
                         "op (scan/transpose/gather/cat/join/split/histogram) over a "
                         ">1024 tile: the multipass reduce and one-element-per-thread "
                         "staging are mutually exclusive, so the staging tail is "
-                        "under-computed (silent-wrong). Split into separate kernels.",
+                        "under-computed (silent-wrong). "
+                        f"{self._wide_scan_eligible(all_ops_iter, block_size)}. "
+                        "Split into separate kernels.",
                         op_name="tt.reduce",
                     )
                 use_multipass = True

@@ -343,16 +343,148 @@ def test_reduce_plus_cooperative_op_over_threadgroup_refuses():
     # hardware limit); test_reduce_plus_cooperative_op_at_threadgroup_computes
     # below pins the numbers for those. This test keeps the case where one
     # thread per element is impossible.
+    # The SCAN half of this is now served by the chunked wide path, where each
+    # thread owns a contiguous RANGE of the tile instead of one element — see
+    # test_reduce_plus_scan_over_threadgroup_computes below, which pins its
+    # values. A histogram stages by a different rule and that path does not
+    # decompose for it, so it keeps refusing, and this test keeps that half.
     N = 2048
-    a = torch.ones(N, device="mps")
-    o = torch.empty(1, device="mps")
-    with pytest.raises(MetalNonRecoverableError):
-        _scan_then_reduce[(1,)](a, o, N=N)
-        torch.mps.synchronize()
     ai = torch.zeros(N, device="mps", dtype=torch.int32)
     oi = torch.empty(1, device="mps", dtype=torch.int32)
     with pytest.raises(MetalNonRecoverableError):
         _hist_then_reduce[(1,)](ai, oi, N=N, B=16)
+        torch.mps.synchronize()
+
+
+@requires
+@pytest.mark.parametrize("N", [2048, 4096])
+def test_reduce_plus_scan_over_threadgroup_computes(N):
+    """A scan too wide for one thread per element is chunked, not refused.
+
+    The tile exceeds the 1024-thread threadgroup, so the scan cannot map one
+    element per thread. It is decomposed instead: each thread scans a
+    CONTIGUOUS range, the range totals are scanned, and each thread folds its
+    exclusive prefix back through its own range. cumsum of N ones is 1..N and
+    its sum is N*(N+1)/2 — an exact integer in fp32 for both sizes here, so
+    this is an equality, not a tolerance.
+    """
+    a = torch.ones(N, device="mps")
+    o = torch.empty(1, device="mps")
+    _scan_then_reduce[(1,)](a, o, N=N)
+    torch.mps.synchronize()
+    assert float(o.cpu()[0]) == N * (N + 1) / 2, (
+        f"scan+reduce over {N} elements: got {float(o.cpu()[0])}, "
+        f"want {N * (N + 1) / 2}"
+    )
+
+
+def test_threadgroup_cap_matches_the_backend():
+    """The codegen's fallback cap must equal the backend's declared one.
+
+    The codegen cannot import the backend module (importing it standalone runs
+    Triton's backend discovery, which raises), so it reads the cap out of
+    sys.modules during a real compile and carries a literal for when it is not
+    loaded. That literal is the thing that can silently drift; this is what
+    catches it.
+    """
+    from triton_msl.codegen._lowerer_reduce import _METAL_THREADGROUP_BYTES
+    import triton_msl.backend.compiler as _c
+
+    assert _METAL_THREADGROUP_BYTES == _c.MetalOptions.max_threadgroup_memory, (
+        f"codegen carries {_METAL_THREADGROUP_BYTES}, backend declares "
+        f"{_c.MetalOptions.max_threadgroup_memory}"
+    )
+
+
+@requires
+def test_wide_scan_refuses_over_the_threadgroup_budget():
+    """A scan too wide for 32 KB refuses HERE, with the width in the message.
+
+    Without this the failure comes from the driver at pipeline-creation time
+    ("Threadgroup memory size (40960) exceeds the maximum") — loud, but it says
+    nothing about scans, and one step wider it degrades to "Compilation
+    failed". 4096 fits in 24 KB and must still compute.
+    """
+    N = 8192
+    a = torch.ones(N, device="mps")
+    o = torch.empty(1, device="mps")
+    with pytest.raises(MetalNonRecoverableError, match="threadgroup memory"):
+        _scan_then_reduce[(1,)](a, o, N=N)
+        torch.mps.synchronize()
+
+
+@triton.jit
+def _scan_stored_and_reduced(a, o, t, N: tl.constexpr):
+    i = tl.arange(0, N)
+    s = tl.cumsum(tl.load(a + i), 0)
+    # the TOTAL first, so the per-element store below comes AFTER the reduce
+    # has rebound this SSA to its accumulator — that order is the one that
+    # exercises the rebind; the other order never reaches it.
+    tl.store(t, tl.sum(s, 0))
+    tl.store(o + i, s)
+
+
+@requires
+@pytest.mark.parametrize("N", [2048, 4096])
+def test_wide_scan_both_stored_and_reduced(N):
+    """A wide scan consumed BOTH per element and by a reduce.
+
+    The multipass reduce rebinds its input SSA to the folded accumulator, and
+    that SSA is this scan's result — so the per-element store after it would
+    read a single scalar for every element unless the scan's binding is put
+    back. cumsum of N ones is 1..N, and the total is N*(N+1)/2.
+    """
+    a = torch.ones(N, device="mps")
+    o = torch.empty(N, device="mps")
+    t = torch.empty(1, device="mps")
+    _scan_stored_and_reduced[(1,)](a, o, t, N=N)
+    torch.mps.synchronize()
+    want = torch.arange(1, N + 1, dtype=torch.float32)
+    got = o.cpu()
+    assert torch.equal(got, want), (
+        f"wide scan stored per element over {N}: first mismatch at "
+        f"{int((got != want).nonzero()[0][0]) if (got != want).any() else -1}, "
+        f"got {got[:4].tolist()}..., want {want[:4].tolist()}..."
+    )
+    assert float(t.cpu()[0]) == N * (N + 1) / 2
+
+
+@triton.jit
+def _revscan_then_reduce(a, o, N: tl.constexpr):
+    i = tl.arange(0, N)
+    tl.store(o, tl.sum(tl.cumsum(tl.load(a + i), 0, reverse=True), 0))
+
+
+@triton.jit
+def _max_combine(x, y):
+    return tl.maximum(x, y)
+
+
+@triton.jit
+def _cummax_then_reduce(a, o, N: tl.constexpr):
+    i = tl.arange(0, N)
+    s = tl.associative_scan(tl.load(a + i), 0, _max_combine)
+    tl.store(o, tl.sum(s, 0))
+
+
+@requires
+def test_wide_scan_refuses_what_it_does_not_decompose():
+    """The chunked path is narrow on purpose, and says so rather than guessing.
+
+    Re-associating a scan into chunks is valid only for an associative
+    combine, and only the forward plain add is exercised end to end. A reverse
+    scan and a non-add combine are refused LOUDLY at a width where the
+    decomposition would otherwise have been taken — they are not silently
+    served by an untested mirror of it.
+    """
+    N = 2048
+    a = torch.ones(N, device="mps")
+    o = torch.empty(1, device="mps")
+    with pytest.raises(MetalNonRecoverableError):
+        _revscan_then_reduce[(1,)](a, o, N=N)
+        torch.mps.synchronize()
+    with pytest.raises(MetalNonRecoverableError):
+        _cummax_then_reduce[(1,)](a, o, N=N)
         torch.mps.synchronize()
 
 

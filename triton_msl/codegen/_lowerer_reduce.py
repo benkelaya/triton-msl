@@ -15,6 +15,7 @@ Mixed into ``GenericLowerer`` because every method reads instance state
 and inserts MSL into ``self.kb``\'s body.
 """
 
+import sys
 import re
 
 from triton_msl.codegen.mlir_walker import SSAValue, _extract_shape
@@ -42,6 +43,86 @@ def _scan_combine_is_float_add(ssa, msl_type, n_values):
     if len(body) != 1 or body[0].op != "arith.addf" or len(rets) != 1:
         return False
     return list(rets[0].operand_ids or []) == [body[0].id]
+
+
+def _scan_combine_is_plain_add(ssa, n_values):
+    """True when the scan's combine region is exactly one add (float or int).
+
+    The chunked decomposition used for a scan WIDER than the threadgroup
+    re-associates the row: each thread scans a contiguous chunk, the chunk
+    totals are scanned, and each thread's exclusive prefix is folded back in.
+    That is only valid for an ASSOCIATIVE combine, and ``tt.scan`` carries an
+    arbitrary region — ``tl.cummax`` and ``tl.associative_scan`` with a user
+    function arrive through the same op — so the region is checked exactly
+    rather than assumed.
+
+    The check is deliberately narrower than "associative": only a single
+    ``arith.addf`` / ``arith.addi``. Product, max, min and the bitwise
+    combines are associative too and would decompose the same way, but no
+    kernel in reach exercises them, and an unexercised numeric path is how a
+    silent-wrong gets shipped. They keep refusing loudly, with the reason
+    named; widening is a separate change that comes with its own proof.
+    """
+    if n_values != 1:
+        return False
+    body = [o for o in (ssa.region_ops or []) if o.op != "tt.scan.return"]
+    rets = [o for o in (ssa.region_ops or []) if o.op == "tt.scan.return"]
+    if len(body) != 1 or len(rets) != 1:
+        return False
+    if body[0].op not in ("arith.addf", "arith.addi"):
+        return False
+    return list(rets[0].operand_ids or []) == [body[0].id]
+
+
+def wide_scan_refusal(ssa, n_values, total, nthreads):
+    """Why this scan cannot take the chunked wide path, or None if it can.
+
+    Returns a reason string; the caller raises. Kept as a pure function so the
+    dispatch decision (generic_lowerer) and the emitter agree by construction
+    instead of by two copies of the same conditions.
+    """
+    if ssa.attrs.get("reverse", False):
+        return ("a REVERSE scan wider than the threadgroup is not supported: the "
+                "chunk decomposition mirrors and that mirrored form is not "
+                "exercised by any kernel in reach, so it is refused rather than "
+                "emitted untested")
+    if n_values > 1:
+        return ("a multi-value tl.associative_scan wider than the threadgroup is "
+                "not supported: each value needs its own chunk state and the "
+                "chunk-total scan assumes one")
+    if not _scan_combine_is_plain_add(ssa, n_values):
+        return ("a scan wider than the threadgroup is decomposed into per-thread "
+                "chunks plus a scan of the chunk totals, which is valid only for "
+                "an associative combine. Only a plain add (tl.cumsum) is served "
+                "here; this scan's combine region is something else")
+    return None
+
+
+# Ops whose emission cannot be skipped because it is observable outside the
+# kernel's own dataflow. Enumerated from the lowerer's own dispatch rather
+# than guessed: skipping a phase that carries any of these would drop the
+# effect silently.
+_SIDE_EFFECTING_OPS = frozenset({
+    "tt.store", "tt.atomic_rmw", "tt.atomic_cas",
+    "tt.assert", "tt.print", "tt.device_print", "tt.debug_barrier",
+})
+
+
+# Metal's threadgroup memory cap. The single source of truth is
+# ``MetalOptions.max_threadgroup_memory`` in the backend, but that module
+# cannot be imported from here — importing it standalone runs Triton's backend
+# discovery, which raises. During a real compile it is already loaded, so it is
+# read out of ``sys.modules``; the literal below is only the value used when it
+# is not, and ``test_threadgroup_cap_matches_the_backend`` fails if the two
+# ever drift apart.
+_METAL_THREADGROUP_BYTES = 32768
+
+
+def metal_threadgroup_bytes():
+    """The declared threadgroup budget, read from the backend when loaded."""
+    mod = sys.modules.get("triton_msl.backend.compiler")
+    cap = getattr(getattr(mod, "MetalOptions", None), "max_threadgroup_memory", None)
+    return cap if isinstance(cap, int) and cap > 0 else _METAL_THREADGROUP_BYTES
 
 
 class _ReduceScanMixin:
@@ -612,6 +693,11 @@ class _ReduceScanMixin:
         phases = self._split_ops_by_reductions()
 
         # Collect all reduce result SSA IDs (scalars available across phases)
+        # Boundary results cross phases: a reduce's as a scalar in function
+        # scope, a wide scan's as a threadgroup array indexed by the wrap
+        # loop. Either way they must NOT be re-emitted into a later loop by
+        # _collect_tensor_deps — a scan in particular cannot be, since its
+        # barriers would land inside that loop.
         reduce_result_ids = set()
         for ops, is_reduce in phases:
             if is_reduce:
@@ -631,17 +717,37 @@ class _ReduceScanMixin:
 
         for phase_idx, (phase_ops, is_reduce) in enumerate(phases):
             if is_reduce:
-                # Lower the reduce op outside any loop.
-                # The reduce's input is already set to the accumulator variable
-                # (overridden in self.env by the preceding phase's accumulation).
+                # Lower the boundary op outside any loop. A reduce's input is
+                # already set to the accumulator variable (overridden in
+                # self.env by the preceding phase's accumulation); a wide scan
+                # builds its own staging loop instead, because its input is a
+                # whole tile rather than one folded scalar.
                 for ssa in phase_ops:
-                    self._lower_op(ssa)
+                    if ssa.op == "tt.scan":
+                        self._lower_wide_scan_phase(
+                            ssa, total, block_size, all_preceding_ops,
+                            reduce_result_ids | arg_ids | lowered_scalar_ids,
+                            lowered_scalar_ids,
+                        )
+                        all_preceding_ops.append(ssa)
+                    else:
+                        self._lower_op(ssa)
+                for _rid, (_expr, _dt, _shape) in getattr(self, "_wide_scan_bindings", {}).items():
+                    self.env[_rid] = _expr
+                    self.env_types[_rid] = _dt
+                    self.env_shapes[_rid] = _shape
                 continue
 
             # Determine if the next phase is a reduce (need accumulation)
+            # Only a REDUCE boundary wants a folded accumulator from this
+            # phase. A scan boundary consumes the whole tile and stages it
+            # itself, so leaving next_reduce None here is what keeps this
+            # phase from trying to read a combine region off a tt.scan.
             next_reduce = None
             if phase_idx + 1 < len(phases) and phases[phase_idx + 1][1]:
-                next_reduce = phases[phase_idx + 1][0][0]
+                _next_boundary = phases[phase_idx + 1][0][0]
+                if _next_boundary.op == "tt.reduce":
+                    next_reduce = _next_boundary
 
             # Separate scalar ops (hoist before loop) from tensor ops (inside loop)
             scalar_ops = [op for op in phase_ops if self._is_scalar_op(op)]
@@ -699,6 +805,26 @@ class _ReduceScanMixin:
             if scalar_terminal_ops:
                 _term_ids = {op.id for op in scalar_terminal_ops}
                 tensor_ops = [op for op in tensor_ops if op.id not in _term_ids]
+
+            # A phase whose only consumer is a following wide-scan boundary
+            # leaves nothing behind: the scan replays the dependencies it
+            # needs into its own staging loop, and so does every later phase.
+            # Emitting this loop anyway costs a full extra read of the tile
+            # for values nothing reads. Ops with side effects are never
+            # skipped — the check is on the ops, not on the phase's position.
+            _next_is_scan = (
+                phase_idx + 1 < len(phases)
+                and phases[phase_idx + 1][1]
+                and phases[phase_idx + 1][0][0].op == "tt.scan"
+            )
+            if (_next_is_scan and not scalar_terminal_ops
+                    and not any(op.op in _SIDE_EFFECTING_OPS for op in tensor_ops)):
+                for ssa in scalar_ops:
+                    if ssa.id not in lowered_scalar_ids:
+                        self._lower_op(ssa)
+                        lowered_scalar_ids.add(ssa.id)
+                all_preceding_ops.extend(phase_ops)
+                continue
 
             # Check if this phase has any tensor ops that need a loop
             has_tensor_ops = len(tensor_ops) > 0
@@ -2519,6 +2645,211 @@ class _ReduceScanMixin:
         if result_read_idx is not None and nr >= 2:
             self._bcast_layout[ssa.id] = f"({result_read_idx})"
             self._register_bcast_layout_by_type(ssa.type_str, tuple(result_shape), f"({result_read_idx})")
+
+    def _lower_wide_scan_phase(self, ssa, total, nthreads, preceding_ops,
+                               available_ids, lowered_scalar_ids):
+        """Emit a scan whose tile is WIDER than the threadgroup, as a phase.
+
+        The one-element-per-thread scan below cannot serve a tile Metal has no
+        threads for. This emits the standard three-phase chunked scan instead,
+        entirely inside one threadgroup — the decomposition is over CHUNKS of
+        the tile, not over dispatches:
+
+          1. staging loop  — every element written to threadgroup memory
+          2. chunk scan    — each thread scans its own CONTIGUOUS range, and
+             publishes that range's total
+          3. total scan    — each thread walks the chunk totals before it
+          4. fold          — each thread adds its exclusive prefix to its range
+
+        Contiguity in step 2 is the correctness condition, not an
+        optimisation: a prefix scan decomposes only if each thread owns an
+        unbroken range, so the strided ``e = lid; e += T`` assignment that
+        suits an elementwise loop is wrong here and is not used.
+
+        The result lives in threadgroup memory and is registered as an
+        expression indexed by the wrap loop's element variable, so consumers
+        in later phases read the element they are actually on.
+        """
+        n_values = len(ssa.operand_ids)
+        reason = wide_scan_refusal(ssa, n_values, total, nthreads)
+        if reason is not None:
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                f"Refusing a {total}-element scan on a {nthreads}-thread "
+                f"threadgroup: {reason}.",
+                op_name="tt.scan",
+            )
+
+        input_dtype = self.env_types.get(ssa.operand_ids[0], "fp32")
+        msl_type, shared_dtype = self._reduce_acc_msl_type(input_dtype)
+
+        # The three arrays this path needs must fit Metal's threadgroup budget.
+        # Without this check an 8192-wide scan asks for 40 KB and the failure
+        # arrives from the DRIVER at pipeline-creation time — "Threadgroup
+        # memory size (40960) exceeds the maximum", which is loud but says
+        # nothing about scans, and a 16384-wide one only manages "Compilation
+        # failed". The lowerer knows the width and the type, so it says it.
+        _bytes = {"half": 2, "short": 2, "ushort": 2,
+                  "long": 8, "ulong": 8}.get(msl_type, 4)
+        _cap = metal_threadgroup_bytes()
+        _need = (total + 2 * nthreads) * _bytes
+        if _need > _cap:
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                f"Refusing a {total}-element scan: the chunked wide path stages "
+                f"the tile plus two {nthreads}-entry chunk-total arrays in "
+                f"threadgroup memory, which is {_need} bytes of {msl_type} and "
+                f"Metal allows {_cap}. Narrow the tile (a tile of "
+                f"{(_cap // _bytes) - 2 * nthreads} elements or fewer fits) or "
+                f"split the scan across programs.",
+                op_name="tt.scan",
+            )
+
+        shared = f"scan_shared_{self._shared_counter}"
+        self._shared_counter += 1
+        self.kb.declare_threadgroup_array(shared, dtype=shared_dtype, size=total)
+        totals = f"scan_tot_{self._shared_counter}"
+        self._shared_counter += 1
+        self.kb.declare_threadgroup_array(totals, dtype=shared_dtype, size=nthreads)
+        # A float chunk total is published as the Neumaier PAIR (sum, residue),
+        # never as the single rounded sum: rounding each chunk total before the
+        # totals are summed loses what the compensation exists to keep, and
+        # that loss is what separated a 1025-wide fp32 row from the oracle by
+        # thousands of ULP where the same row at 1024 was bit-exact.
+        totals_c = None
+        if msl_type in ("float", "half"):
+            totals_c = f"scan_totc_{self._shared_counter}"
+            self._shared_counter += 1
+            self.kb.declare_threadgroup_array(totals_c, dtype=shared_dtype, size=nthreads)
+
+        # --- 1. staging loop: recompute this phase's input per element -----
+        replay = self._collect_tensor_deps([ssa], preceding_ops, available_ids)
+        for op in [o for o in replay if self._is_scalar_op(o)]:
+            if op.id not in lowered_scalar_ids:
+                self._lower_op(op)
+                lowered_scalar_ids.add(op.id)
+        replay_tensor = [o for o in replay if not self._is_scalar_op(o)]
+
+        self._needs_wrapping = True
+        self.kb.raw_line(
+            f"    for (uint _loop_e = lid; _loop_e < {total}u; _loop_e += {nthreads}u) {{")
+        for op in replay_tensor:
+            self._lower_op(op)
+        input_var = self._lookup(ssa.operand_ids[0])
+        self.kb.raw_line(f"        {shared}[_loop_e] = ({msl_type}){input_var};")
+        self.kb.raw_line(f"    }}")
+        self._needs_wrapping = False
+        self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+
+        self._emit_wide_scan_chunked(ssa, shared, totals, totals_c, total, nthreads, msl_type)
+
+        # --- the result is threadgroup-resident, indexed by the wrap loop --
+        for rid in (list(ssa.result_ids) if ssa.result_ids else [ssa.id]):
+            self.env[rid] = f"{shared}[_loop_e]"
+            self.env_types[rid] = shared_dtype
+            self.env_shapes[rid] = (total,)
+            # Remembered because a reduce OF this scan rebinds the same SSA to
+            # its own accumulator, to fold the tile. That rebind is how the
+            # multipass reduce works and must stand while the reduce is
+            # emitted, but a later per-element consumer of the SAME scan (a
+            # kernel that stores the scan AND stores its total) would then read
+            # the folded scalar instead of its own element. The binding is put
+            # back once the reduce has been emitted.
+            self._wide_scan_bindings[rid] = (f"{shared}[_loop_e]", shared_dtype, (total,))
+
+    def _emit_wide_scan_chunked(self, ssa, shared, totals, totals_c, total, nthreads, msl_type):
+        """Steps 2-4 of the chunked scan, over an already-staged tile."""
+        chunk = (total + nthreads - 1) // nthreads
+        # Only a plain add reaches here (wide_scan_refusal), and a float add
+        # carries the same Neumaier compensation the narrow scan carries — the
+        # ULP fix must not come undone on exactly the widest rows, where the
+        # running partial has the most roundings to accumulate.
+        compensate = msl_type in ("float", "half")
+
+        lo = self._next_var("scan_lo")
+        hi = self._next_var("scan_hi")
+        acc = self._next_var("scan_acc")
+        self.kb.raw_line(f"    uint {lo} = lid * {chunk}u;")
+        self.kb.raw_line(f"    uint {hi} = min({lo} + {chunk}u, {total}u);")
+        self.kb.raw_line(f"    {msl_type} {acc} = ({msl_type})0;")
+        comp = None
+        if compensate:
+            comp = self._next_var("scan_comp")
+            self.kb.raw_line(f"    {msl_type} {comp} = ({msl_type})0;")
+
+        def _add(dst_acc, dst_comp, rhs, indent):
+            """One compensated (or plain) accumulation of ``rhs`` into ``dst_acc``."""
+            if dst_comp is None:
+                self.kb.raw_line(f"{indent}{dst_acc} = {dst_acc} + {rhs};")
+                return
+            t = self._next_var("scan_t")
+            self.kb.raw_line(f"{indent}{msl_type} {t} = {dst_acc} + {rhs};")
+            self.kb.raw_line(
+                f"{indent}{dst_comp} += (fabs({dst_acc}) >= fabs({rhs})) "
+                f"? (({dst_acc} - {t}) + {rhs}) : (({rhs} - {t}) + {dst_acc});")
+            self.kb.raw_line(f"{indent}{dst_acc} = {t};")
+
+        # --- 2. per-thread contiguous chunk TOTAL --------------------------
+        # The chunk's elements are NOT written here. Writing the local prefix
+        # and then adding a separately-rounded chunk offset in step 4 rounds
+        # twice, and the two roundings cancel catastrophically wherever the
+        # running sum crosses zero: on fp32 rows of 1025 and up that read
+        # thousands of ULP from the oracle where the one-thread-per-element
+        # scan, which re-adds in the oracle's own order, reads zero. Step 4
+        # re-scans the chunk from the carried compensated prefix instead, so
+        # each element is rounded exactly once.
+        e = self._next_var("scan_e")
+        v = self._next_var("scan_v")
+        self.kb.raw_line(f"    for (uint {e} = {lo}; {e} < {hi}; {e}++) {{")
+        self.kb.raw_line(f"        {msl_type} {v} = {shared}[{e}];")
+        _add(acc, comp, v, "        ")
+        self.kb.raw_line(f"    }}")
+        # A thread whose chunk starts past the end contributes the identity.
+        # ``0`` is the identity of the only combine that reaches here (add);
+        # widening the combine set means widening this line with it.
+        self.kb.raw_line(f"    {totals}[lid] = ({lo} < {total}u) ? {acc} : ({msl_type})0;")
+        if totals_c is not None:
+            self.kb.raw_line(
+                f"    {totals_c}[lid] = ({lo} < {total}u) ? {comp} : ({msl_type})0;")
+        self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+
+        # --- 3. each thread walks the chunk totals before it ---------------
+        pre = self._next_var("scan_pre")
+        pcomp = None
+        self.kb.raw_line(f"    {msl_type} {pre} = ({msl_type})0;")
+        if compensate:
+            pcomp = self._next_var("scan_pcomp")
+            self.kb.raw_line(f"    {msl_type} {pcomp} = ({msl_type})0;")
+        j = self._next_var("scan_j")
+        tv = self._next_var("scan_tv")
+        self.kb.raw_line(f"    for (uint {j} = 0u; {j} < lid; {j}++) {{")
+        self.kb.raw_line(f"        {msl_type} {tv} = {totals}[{j}];")
+        _add(pre, pcomp, tv, "        ")
+        if totals_c is not None:
+            tvc = self._next_var("scan_tvc")
+            self.kb.raw_line(f"        {msl_type} {tvc} = {totals_c}[{j}];")
+            _add(pre, pcomp, tvc, "        ")
+        self.kb.raw_line(f"    }}")
+        pre_fin = pre if pcomp is None else f"({pre} + {pcomp})"
+
+        # --- 4. re-scan this thread's range from the carried prefix --------
+        # (pre, pcomp) is the compensated sum of every element before this
+        # chunk, so continuing the same compensated accumulation through the
+        # chunk gives each element ONE rounding of the whole prefix — the
+        # value the oracle rounds to — rather than a rounded partial plus a
+        # rounded offset. Each thread rewrites ONLY its own range, which no
+        # other thread reads until the barrier below, so steps 3 and 4 need
+        # no fence between them.
+        e2 = self._next_var("scan_e")
+        v2 = self._next_var("scan_v")
+        self.kb.raw_line(f"    for (uint {e2} = {lo}; {e2} < {hi}; {e2}++) {{")
+        self.kb.raw_line(f"        {msl_type} {v2} = {shared}[{e2}];")
+        _add(pre, pcomp, v2, "        ")
+        self.kb.raw_line(f"        {shared}[{e2}] = {pre_fin};")
+        self.kb.raw_line(f"    }}")
+        self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
     def _lower_scan(self, ssa: SSAValue):
         """tt.scan → prefix scan via shared memory.
