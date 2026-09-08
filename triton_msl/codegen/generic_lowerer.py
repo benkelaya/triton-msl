@@ -1793,6 +1793,45 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 self._total_elements = block_size
                 block_size = 1024  # Cap dispatch to Metal max
 
+        # ---- the generic path is committed here ----------------------
+        # Every template has declined by this point, so this is where the
+        # generic per-element lowering decides its own dispatch. Until here the
+        # size is PROVISIONAL: a template that takes the kernel overwrites it
+        # (the matmul templates use 128 threads), which is why the decision
+        # cannot be made where the size is first computed.
+        #
+        # A tile wider than the threadgroup cannot be launched as-is. Cover it
+        # with the per-element loop; refuse only when that is unsafe, which is
+        # when the kernel carries a barrier — a threadgroup_barrier inside a
+        # per-element loop is undefined. The hole this closes is narrow and
+        # real: `size_per_thread > 1 and block_size > num_threads` with
+        # barriers present falls through every branch above and leaves the tile
+        # as the dispatch size, which then dies in the driver with "a
+        # threadgroup of 4096 threads is not dispatchable" — the symptom, in
+        # the wrong layer, and for an AUTOTUNED kernel it takes the whole
+        # screen down instead of letting the tuner skip that config.
+        #
+        # NOTE: MetalNonRecoverableError is the MODULE-level import. Importing
+        # it again here would make it a function-local for the whole of
+        # lower(), and every earlier reference to it would raise
+        # UnboundLocalError — which is exactly what an earlier attempt at this
+        # did, breaking seven FlashAttention and reduce tests in a way that
+        # read like over-refusal and was not.
+        if (block_size > 1024 and not use_multipass
+                and not self._mept_single_pass and not self._needs_wrapping):
+            if has_barrier_ops:
+                raise MetalNonRecoverableError(
+                    f"a {block_size}-element tile needs {block_size} threads and "
+                    f"a threadgroup holds at most 1024. The kernel carries a "
+                    f"barrier, so covering the tile with a per-element loop "
+                    f"would be undefined. Use a tile whose product is <= 1024, "
+                    f"or split the kernel.",
+                    op_name="tt.dot",
+                )
+            self._needs_wrapping = True
+            self._total_elements = block_size
+            block_size = 1024
+
         self.effective_block_size = block_size
 
         # If the kernel is too large for the generic lowerer (cooperative ops
