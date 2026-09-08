@@ -490,6 +490,47 @@ class _ReduceScanMixin:
         }
         return combine_op, identities.get(combine_op, "0.0f")
 
+
+    # ------------------------------------------------------------------
+    # Compensated (Neumaier) summation for a FLOAT reduce.
+    #
+    # A sequential fp32 sum rounds once per element, and over a long axis that
+    # dominates the result's error. Measured on the reference bank, every
+    # matrix-vector row came back at EXACTLY the naive host-fp32 error (addmm
+    # 80 ULP, matmul 10, mm 73): `tl.sum` lowers here to a sequential loop
+    # while the CUDA backend reduces in a tree. Carrying the part each addition
+    # cannot hold and folding it in once at the end costs three flops per
+    # element and takes the same dot from 131 ULP to 16 against an fp64 oracle,
+    # where CUDA measures 18.2 on the same inputs.
+    #
+    # Only a FLOAT SUM is compensated: max/min/and/or/xor are exact, and an
+    # integer sum has nothing to compensate. Under fast-math the compiler may
+    # fold the compensation away, which degrades to exactly the previous
+    # behaviour and never to something worse.
+    # ------------------------------------------------------------------
+
+    def _reduce_comp_open(self, combine_op, msl_type, indent):
+        """Declare the compensation term for a float sum; None otherwise."""
+        if combine_op != "sum" or msl_type not in ("float", "half"):
+            return None
+        comp = self._next_var("reduce_comp")
+        self.kb.raw_line(f"{indent}{msl_type} {comp} = 0;")
+        return comp
+
+    @staticmethod
+    def _reduce_combine_stmt(comp, msl_type, combine_expr):
+        """The in-loop update over the locals ``acc`` / ``val``."""
+        if comp is None:
+            return f"acc = {combine_expr};"
+        return (f"{{ {msl_type} _nt = acc + val; "
+                f"{comp} += (fabs(acc) >= fabs(val)) ? ((acc - _nt) + val) "
+                f": ((val - _nt) + acc); acc = _nt; }}")
+
+    @staticmethod
+    def _reduce_finish(comp):
+        """The accumulator's final value, with the compensation folded in."""
+        return "acc" if comp is None else f"(acc + {comp})"
+
     def _reduce_identity_combine(self, combine_op, msl_type):
         """Return (identity, combine_expr) for an `acc`/`val` sequential reduce.
 
@@ -2051,11 +2092,13 @@ class _ReduceScanMixin:
             self.kb.raw_line(f"    {msl_type} {result_var} = {identity};")
             self.kb.raw_line(f"    if (lid < {M}u) {{")
             self.kb.raw_line(f"        {msl_type} acc = {identity};")
+            _comp = self._reduce_comp_open(combine_op, msl_type, "        ")
             self.kb.raw_line(f"        for (uint j = 0; j < {N}u; j++) {{")
             self.kb.raw_line(f"            {msl_type} val = {shared_name}[lid * {N}u + j];")
-            self.kb.raw_line(f"            acc = {combine_expr};")
+            self.kb.raw_line(
+                f"            {self._reduce_combine_stmt(_comp, msl_type, combine_expr)}")
             self.kb.raw_line(f"        }}")
-            self.kb.raw_line(f"        {result_shared}[lid] = acc;")
+            self.kb.raw_line(f"        {result_shared}[lid] = {self._reduce_finish(_comp)};")
             self.kb.raw_line(f"    }}")
             self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
             # How the result is read back decides its LAYOUT, and there are two
@@ -2088,11 +2131,13 @@ class _ReduceScanMixin:
             self.kb.raw_line(f"    {msl_type} {result_var} = {identity};")
             self.kb.raw_line(f"    if (lid < {N}u) {{")
             self.kb.raw_line(f"        {msl_type} acc = {identity};")
+            _comp = self._reduce_comp_open(combine_op, msl_type, "        ")
             self.kb.raw_line(f"        for (uint i = 0; i < {M}u; i++) {{")
             self.kb.raw_line(f"            {msl_type} val = {shared_name}[i * {N}u + lid];")
-            self.kb.raw_line(f"            acc = {combine_expr};")
+            self.kb.raw_line(
+                f"            {self._reduce_combine_stmt(_comp, msl_type, combine_expr)}")
             self.kb.raw_line(f"        }}")
-            self.kb.raw_line(f"        {result_shared}[lid] = acc;")
+            self.kb.raw_line(f"        {result_shared}[lid] = {self._reduce_finish(_comp)};")
             self.kb.raw_line(f"    }}")
             self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
             # All threads read their column's result. See the axis==1 branch for
@@ -2193,6 +2238,7 @@ class _ReduceScanMixin:
         # Reduction loop: each result thread reduces along the axis
         self.kb.raw_line(f"    for (uint _r = lid; _r < {result_total}u; _r += {block_size}u) {{")
         self.kb.raw_line(f"        {msl_type} acc = {identity};")
+        _comp = self._reduce_comp_open(combine_op, msl_type, "        ")
 
         # Compute result indices and shared memory indexing based on axis
         if axis == 0:
@@ -2214,9 +2260,10 @@ class _ReduceScanMixin:
             self.kb.raw_line(f"        for (uint _a = 0; _a < {axis_size}u; _a++) {{")
             self.kb.raw_line(f"            {msl_type} val = {shared_name}[_i * {N * K}u + _j * {K}u + _a];")
 
-        self.kb.raw_line(f"            acc = {combine_expr};")
+        self.kb.raw_line(
+            f"            {self._reduce_combine_stmt(_comp, msl_type, combine_expr)}")
         self.kb.raw_line(f"        }}")
-        self.kb.raw_line(f"        {result_shared}[_r] = acc;")
+        self.kb.raw_line(f"        {result_shared}[_r] = {self._reduce_finish(_comp)};")
         self.kb.raw_line(f"    }}")
         self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
@@ -2366,6 +2413,7 @@ class _ReduceScanMixin:
         axis_size = input_shape[axis]
         self.kb.raw_line(f"    for (uint _r = lid; _r < {result_total}u; _r += {block_size}u) {{")
         self.kb.raw_line(f"        {msl_type} acc = {identity};")
+        _comp = self._reduce_comp_open(combine_op, msl_type, "        ")
 
         # Decompose _r into result coords, then build src base offset by
         # inserting a 0 at position axis and combining with src_strides.
@@ -2394,9 +2442,10 @@ class _ReduceScanMixin:
 
         self.kb.raw_line(f"        for (uint _a = 0; _a < {axis_size}u; _a++) {{")
         self.kb.raw_line(f"            {msl_type} val = {shared_name}[_base + _a * {src_strides[axis]}u];")
-        self.kb.raw_line(f"            acc = {combine_expr};")
+        self.kb.raw_line(
+            f"            {self._reduce_combine_stmt(_comp, msl_type, combine_expr)}")
         self.kb.raw_line(f"        }}")
-        self.kb.raw_line(f"        {result_shared}[_r] = acc;")
+        self.kb.raw_line(f"        {result_shared}[_r] = {self._reduce_finish(_comp)};")
         self.kb.raw_line(f"    }}")
         self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
