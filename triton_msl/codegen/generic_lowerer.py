@@ -1945,36 +1945,80 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 # these kernels; they emitted INVALID MSL, which is worse than
                 # a refusal.
                 #
-                # The real blocker is a SCOPE problem, recorded here so the
-                # next attempt does not re-derive it. To stage a
-                # shared-memory-staged tt.dot's operands the emitter closes
-                # the per-element loop, emits
-                #   for (_sa = lid; _sa < 1024u; _sa += 1024u) smem[_sa] = val;
-                # and reopens it. `val` was computed INSIDE the closed loop, so
-                # the MSL references an undeclared identifier.
+                # The blocker is STRUCTURAL, not merely a scope slip, and
+                # it is recorded exactly here so the next attempt does not
+                # re-derive it. Measured 2026-09-09 by lifting this refusal
+                # and compiling what came out: 9 errors, 3 causes.
                 #
-                # The staging itself is correctly sized — the operand tile is
-                # 1024 and each thread stages one element, which is that
-                # branch's own contract. (An earlier note here claimed it
-                # staged a quarter of the operand by confusing the operand's
-                # 1024 with the accumulator's 4096; it does not.)
+                # The nesting is the whole problem. The wrap loop is emitted
+                # OUTSIDE the kernel's scf.for k-loops:
                 #
-                # Nor is a naive hoist sufficient: the wrap iterates
-                # `_loop_e ∈ {lid, lid+1024, ...}` and the staging wants the
-                # value at the FIRST iteration, so keeping the variable's last
-                # value would stage the wrong element into slot `lid`. The
-                # operand's dependency chain has to be replayed outside the
-                # loop with the index bound to `lid`.
+                #   for (_loop_e = lid; _loop_e < 2048u; _loop_e += 1024u) {
+                #     for (k_31) { for (k_32) { for (k_33) {
+                #       ... the tt.dot and its operand loads live HERE ...
+                #
+                # Staging an operand needs a cooperative loop over all
+                # threads, which must be OUTSIDE the wrap. But the operand's
+                # address depends on the innermost induction variable `k_33`
+                # and on values declared in the k-loop body. So the staging
+                # would have to be inside the k-loop and outside the wrap at
+                # once, and the wrap encloses the k-loop. That is not a
+                # position that exists.
+                #
+                # What the emitter actually does is emit ONE `}` "to close the
+                # wrapping loop". Inside a k-loop the innermost open brace is
+                # the k-loop, so it closes THAT, and the staged fill then
+                # references `k_33`, `r_36`, `r_38`, `r_43`, `r_57` from the
+                # scope it just left. Seven of the nine errors are that.
+                #
+                # Two more defects are behind it, both invisible while this
+                # refuses, and neither fixed by getting the braces right:
+                #   * the staged fill DROPS THE LOAD'S MASK — it emits
+                #     `smem[_sa] = ptr[addr]` where the in-loop form is
+                #     `mask ? ptr[addr] : 0`. A silent wrong, not an error.
+                #     `_rebuild_staged_fill_mask` exists and is used on the
+                #     store side, but it resolves a single arith.cmpi and this
+                #     mask is six of them joined by arith.andi.
+                #   * the epilogue reads the smem accumulator as a scalar:
+                #     `static_cast<half>(smem_iter_0)` — "static_cast from
+                #     'threadgroup float *' to 'half'". Its remedy is the
+                #     landed `_wide_scan_bindings` pattern (bind the value to
+                #     `smem[_loop_e]`), and it is reachable ONLY on this path.
+                #
+                # The remedy is not a brace fix and not a hoist. The wrap must
+                # go INSIDE the k-loops so the cooperative phases sit between
+                # per-element phases at one nesting level — the same phase
+                # decomposition `_split_ops_by_reductions` /
+                # `_lower_multipass_reduction` already perform for the wide
+                # scan:
+                #
+                #   for (k_31) { for (k_32) { for (k_33) {
+                #     for (_loop_e = lid; ...) { ...elementwise... }
+                #     for (_sa = lid; ...)     { mask ? ptr[addr(_sa)] : 0 }
+                #     threadgroup_barrier(...);
+                #     for (_de = lid; ...)     { ...the dot... }
+                #   } } }
+                #
+                # (An earlier note here claimed the staging covered a quarter
+                # of the operand, confusing the operand's 1024 with the
+                # accumulator's 4096; it does not. And the address rebuild
+                # itself WORKS — `_rebuild_staged_fill_offset` emitted a
+                # complete per-element address for both operands.)
                 raise MetalNonRecoverableError(
                     f"a {block_size}-element tile needs {block_size} threads and "
                     f"a threadgroup holds at most 1024. The kernel carries a "
-                    f"shared-memory-staged tt.dot: staging its operands closes "
-                    f"the per-element loop, and the operand value was computed "
-                    f"inside it, so the emitted MSL would reference an "
-                    f"out-of-scope identifier. Not a barrier-divergence "
-                    f"problem — at a multiple of 1024 every thread reaches "
-                    f"every barrier the same number of times. Use a tile whose "
-                    f"product is <= 1024, or split the kernel.",
+                    f"shared-memory-staged tt.dot inside an scf.for, and the "
+                    f"per-element wrap loop is emitted OUTSIDE that loop. "
+                    f"Staging an operand needs a cooperative loop outside the "
+                    f"wrap, but the operand's address depends on the k-loop's "
+                    f"induction variable, so the staging would have to be "
+                    f"inside the k-loop and outside the wrap at once. Serving "
+                    f"this needs the wrap moved inside the k-loops so the "
+                    f"cooperative phases sit between per-element phases at one "
+                    f"nesting level. Not a barrier-divergence problem — at a "
+                    f"multiple of 1024 every thread reaches every barrier the "
+                    f"same number of times. Use a tile whose product is "
+                    f"<= 1024, or split the kernel.",
                     op_name="tt.dot",
                 )
             self._needs_wrapping = True
