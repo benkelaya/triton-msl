@@ -1907,13 +1907,50 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # read like over-refusal and was not.
         if (block_size > 1024 and not use_multipass
                 and not self._mept_single_pass and not self._needs_wrapping):
+            # A barrier inside the per-element loop is undefined only when
+            # threads reach it a DIFFERENT NUMBER OF TIMES. The loop is
+            # `for (_loop_e = lid; _loop_e < total; _loop_e += 1024)`, whose
+            # trip count is ceil((total - lid) / 1024) — identical for every
+            # lid exactly when 1024 divides total, and differing by one
+            # otherwise. So the tile's width decides it, not the presence of a
+            # barrier, and refusing on the barrier alone refused the even case
+            # too: a 2048-element tile gives every thread exactly two
+            # iterations and every barrier is reached uniformly.
+            #
+            # That over-refusal is what makes the whole upscaler family
+            # unreachable on this branch — all eight models fail at
+            # aten.convolution::0 with this message, and all of them have a
+            # 2048-element tile.
             if has_barrier_ops:
+                # The stated reason used to be barrier divergence, and that
+                # reason is WRONG for the common case. The loop is
+                # `for (_loop_e = lid; _loop_e < total; _loop_e += 1024)`,
+                # whose trip count is identical for every lid exactly when
+                # 1024 divides total — so at 2048, the width every upscaler
+                # convolution uses, every thread runs two iterations and every
+                # barrier is reached uniformly. Narrowing the refusal to the
+                # non-uniform case was tried and the dispatch then accepted
+                # these kernels; they emitted INVALID MSL, which is worse than
+                # a refusal.
+                #
+                # The real blocker is downstream and is recorded here so the
+                # next attempt does not re-derive it: a shared-memory-staged
+                # tt.dot stages its operand with
+                #   for (_sa = lid; _sa < 1024u; _sa += 1024u) smem[_sa] = val;
+                # one element per thread, assigning a value COMPUTED in the
+                # per-element loop. Under a wrapped tile that loop has already
+                # closed (so the value is out of scope) and covers 4096
+                # elements against the staging's 1024. The staging does not
+                # hold under wrapping at all; hoisting the index values, which
+                # an earlier note proposed, would not fix it.
                 raise MetalNonRecoverableError(
                     f"a {block_size}-element tile needs {block_size} threads and "
                     f"a threadgroup holds at most 1024. The kernel carries a "
-                    f"barrier, so covering the tile with a per-element loop "
-                    f"would be undefined. Use a tile whose product is <= 1024, "
-                    f"or split the kernel.",
+                    f"shared-memory-staged tt.dot, whose operand staging maps "
+                    f"one element per thread and cannot cover a wrapped tile — "
+                    f"not because a barrier in the loop would diverge, which at "
+                    f"a multiple of 1024 it would not. Use a tile whose product "
+                    f"is <= 1024, or split the kernel.",
                     op_name="tt.dot",
                 )
             self._needs_wrapping = True

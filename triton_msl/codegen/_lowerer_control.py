@@ -168,9 +168,21 @@ class _ControlFlowMixin:
                 smem_name = f"smem_iter_{self._shared_counter}"
                 self._shared_counter += 1
                 self.kb.declare_threadgroup_array(smem_name, dtype="fp32", size=init_total)
-                # Cooperative init from the constant value
+                # Cooperative init. When the init value is ITSELF a
+                # shared-memory array — a nested loop whose iter-arg is the
+                # enclosing loop's accumulator, which is what a convolution's
+                # three nested K-loops produce — `_lookup` returns the array's
+                # NAME, and assigning it to an element emits
+                # `smem_iter_1[_si] = smem_iter_0;`: an array assigned to a
+                # scalar. The YIELD side already copies element-wise when it
+                # sees a different source array; the INIT side did not.
+                _src_smem = (getattr(self, "_shared_mem_descs", {}) or {}).get(init_id)
                 self.kb.raw_line(f"    for (uint _si = lid; _si < {init_total}u; _si += {bs}u) {{")
-                self.kb.raw_line(f"        {smem_name}[_si] = {init_val};")
+                if _src_smem is not None:
+                    _src_name = _src_smem[0] if isinstance(_src_smem, (tuple, list)) else _src_smem
+                    self.kb.raw_line(f"        {smem_name}[_si] = {_src_name}[_si];")
+                else:
+                    self.kb.raw_line(f"        {smem_name}[_si] = {init_val};")
                 self.kb.raw_line(f"    }}")
                 self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
                 iter_vars.append(smem_name)
