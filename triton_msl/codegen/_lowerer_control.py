@@ -26,6 +26,66 @@ from triton_msl.codegen.msl_types import triton_type_to_msl
 from triton_msl.codegen._lowerer_helpers import _mlir_to_triton_dtype
 
 
+def _static_numel(type_str):
+    """Element count from an MLIR type string, or None when it is unknown.
+
+    ``tensor<4096xf32, #ttg.blocked<...>>`` -> 4096, ``tensor<64x64xf16>`` ->
+    4096, ``f32`` / ``!tt.ptr<f16>`` -> 1. The walker records the type on every
+    SSA value, so the width is known BEFORE the value is lowered — unlike
+    ``env_shapes``, which is filled during emission.
+    """
+    found = re.search(r"tensor<([0-9x]+)x[a-zA-Z0-9_!<>.]+", type_str or "")
+    if not found:
+        return None if not type_str else (1 if "tensor<" not in type_str else None)
+    total = 1
+    for part in found.group(1).split("x"):
+        if not part.isdigit():
+            return None
+        total *= int(part)
+    return total
+
+
+# Ops whose lowering is PURE PER-ELEMENT: emitting them once per ``_loop_e``
+# iteration covers the tile exactly, with no cross-thread communication and no
+# state carried between iterations. An allowlist, not a denylist: a region
+# holding anything else keeps the existing lowering (and the existing refusal
+# if that lowering cannot cover the tile), so this can never silently change a
+# kernel the lowerer already handles.
+_PER_ELEMENT_REGION_OPS = frozenset(
+    {
+        "tt.splat",
+        "tt.broadcast",
+        "tt.expand_dims",
+        "tt.make_range",
+        "tt.addptr",
+        "tt.load",
+        "tt.store",
+        "tt.bitcast",
+        "tt.int_to_ptr",
+        "tt.ptr_to_int",
+        "tt.fp_to_fp",
+        "tt.extern_elementwise",
+        "tt.precise_sqrt",
+        "tt.precise_divf",
+        "tt.mulhiui",
+        "tt.umulhi",
+        "tt.clampf",
+        "scf.yield",
+    }
+)
+
+
+def _region_is_pure_per_element(region_ops):
+    """True when every op in the region is per-element (allowlist above)."""
+    for op in region_ops or ():
+        if op.op.startswith("arith.") or op.op.startswith("math."):
+            continue
+        if op.op in _PER_ELEMENT_REGION_OPS:
+            continue
+        return False
+    return True
+
+
 class _ControlFlowMixin:
     """``scf.*`` and atomic op lowering for ``GenericLowerer``."""
 
@@ -291,6 +351,45 @@ class _ControlFlowMixin:
         _prev_body_ops = getattr(self, "_current_loop_body_ops", None)
         self._current_loop_body_ops = list(ssa.region_ops or [])
 
+        # A per-element region inside a kernel whose TILE IS WIDER THAN THE
+        # THREADGROUP must be emitted inside the per-element loop, exactly as
+        # the multipass reduce path does for its non-reduce phases.
+        #
+        # ``_is_scalar_op`` calls an ``scf.for`` scalar (it produces no tensor
+        # value), so a data-parallel region is hoisted OUT of the phase wrap
+        # loop and emitted with ``_needs_wrapping`` False — one element per
+        # thread, i.e. only ``lid`` of each tile-stride. Every load in the
+        # region then reads a quarter of its tile and every store writes a
+        # quarter of its tile. The store guard in ``generic_lowerer`` refuses
+        # that (native_group_norm C64HW257G8: a 4096-element store with 1024
+        # threads), and the loads had no guard at all. Wrapping the region is
+        # the lowering that covers the tile; the refusal stays for the regions
+        # this cannot cover (anything not purely per-element, or carrying a
+        # loop value, where the per-element loop would change the semantics).
+        _wrap_region = False
+        _wrap_total = getattr(self, "_total_elements", None)
+        if (
+            _wrap_total
+            and _wrap_total > bs
+            and not self._needs_wrapping
+            and not self._mept_single_pass
+            and n_iter_args == 0
+            and ssa.region_ops
+            and _region_is_pure_per_element(ssa.region_ops)
+            and any(
+                _static_numel(getattr(o, "type_str", "") or "") == _wrap_total
+                for o in ssa.region_ops
+            )
+        ):
+            _wrap_region = True
+            self.kb.raw_line(
+                f"    for (uint _loop_e = lid; _loop_e < {_wrap_total}u; "
+                f"_loop_e += {bs}u) {{"
+            )
+            self._needs_wrapping = True
+        # Env bindings displaced by the re-emission below, restored on exit.
+        _wrap_saved_env = {}
+
         # Stage A pre-emission: if any external tensor index ops (make_range,
         # splat, broadcast, etc.) referenced by body ops are NOT yet in env,
         # emit them now (at the outer body scope, _needs_wrapping unchanged)
@@ -344,7 +443,7 @@ class _ControlFlowMixin:
                 for _oid in _bop.operand_ids or []:
                     if _oid in _body_ids or _oid in _ext_seen:
                         continue
-                    if self.env.get(_oid) is not None:
+                    if self.env.get(_oid) is not None and not _wrap_region:
                         continue  # already in env
                     _ext_seen.add(_oid)
                     # Find the producing op
@@ -353,6 +452,15 @@ class _ControlFlowMixin:
                         _ext_needed.append(_prod)
             # Emit missing safe external ops before the body starts
             for _ext_op in _ext_needed:
+                if _wrap_region and _ext_op.id in self.env:
+                    # The cached binding was produced OUTSIDE the per-element
+                    # loop, where a tile index resolves to plain ``lid`` — the
+                    # first element of each tile-stride only. Inside the loop
+                    # the same op must resolve to ``_loop_e``, so drop the
+                    # binding and re-emit here. These are index-only ops
+                    # (_SAFE_PREEMIT_OPS), so re-emitting them is free of
+                    # side effects; the outer binding is restored on exit.
+                    _wrap_saved_env[_ext_op.id] = self.env.pop(_ext_op.id)
                 if self.env.get(_ext_op.id) is None:
                     self._lower_op(_ext_op)
 
@@ -443,6 +551,11 @@ class _ControlFlowMixin:
                         self._lower_op(body_op)
         finally:
             self._current_loop_body_ops = _prev_body_ops
+            if _wrap_region:
+                self._needs_wrapping = False
+                self.kb.raw_line("    }")
+                for _sid, _sval in _wrap_saved_env.items():
+                    self.env[_sid] = _sval
 
         self.kb.raw_line("    }")
 

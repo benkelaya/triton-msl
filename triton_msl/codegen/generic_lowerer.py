@@ -3575,7 +3575,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 f"{_num_threads} threads: the base path stores one element per "
                 f"thread, so a tile wider than the threadgroup would silently "
                 f"drop the rest. Launch with num_warps = BLOCK/32 (so "
-                f"num_threads == BLOCK), or reduce BLOCK."
+                f"num_threads == BLOCK), or reduce BLOCK. "
+                f"[strategy: mept_single_pass="
+                f"{getattr(self, '_mept_single_pass', None)}, needs_wrapping="
+                f"{getattr(self, '_needs_wrapping', None)}, total_elements="
+                f"{getattr(self, '_total_elements', None)}, "
+                f"in_multipass_phase="
+                f"{getattr(self, '_in_multipass_phase', None)}]"
             )
 
         ptr_info = self.env_is_ptr.get(ptr_id)
