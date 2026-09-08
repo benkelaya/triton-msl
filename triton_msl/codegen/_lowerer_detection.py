@@ -1943,12 +1943,9 @@ class _DetectionMixin:
                 return None
             return sp.operand_ids[0]
 
-        import os as _dbg
-        _trace = bool(_dbg.environ.get("TMSL_DEBUG_EPILOGUE"))
 
-        def _bail(why):
-            if _trace:
-                print(f"  [epilogue detector] bail: {why}", flush=True)
+        def _bail(_why):
+            """Named for readability: every early exit keeps the refusal."""
             return None
 
         acc_ids = self._k_loop_acc_ids()
@@ -2011,7 +2008,44 @@ class _DetectionMixin:
         if cur is None or cur.op != "tt.load":
             return _bail(f"bias is not a load (got {cur and cur.op})")
         if axis != "0":
-            return _bail(f"bias broadcast axis is {axis!r}, not a column bias")
+            # Not a (1, N) broadcast: it may still be a fully STRIDED 2-D bias,
+            #   bias_ptrs = bias + offs_m[:, None]*bias_ms + offs_n[None, :]*bias_ns
+            # which is what baddbmm emits (its strides are runtime args and are
+            # legitimately 0 for a broadcast operand, so the same code covers a
+            # row bias, a column bias and a full tile). The scalar strided
+            # template can index that directly — it has `m` and `n` in scope —
+            # so hand it the two stride names rather than refusing.
+            strided = self._read_2d_bias_strides(cur, by_id)
+            if strided is None:
+                return _bail(f"bias is neither an axis-0 broadcast nor a "
+                             f"readable 2-D strided load (axis={axis!r})")
+            bias_ptr2 = self._trace_ptr_source(cur.operand_ids[0], by_id)
+            if bias_ptr2 is None:
+                return _bail("2-D bias pointer does not trace to an argument")
+            _arg_name2 = {a.id: a.name for a in self.graph.args
+                          if not getattr(a, "is_ptr", False)}
+            alpha_name2 = _arg_name2.get(alpha_id)
+            beta_name2 = _arg_name2.get(beta_id)
+            if alpha_name2 is None or beta_name2 is None:
+                return _bail("alpha/beta are not scalar kernel arguments")
+            _badv = self._bias_batch_advance(bias_ptr2.name)
+            if _badv is None:
+                return _bail("the bias base carries a program-id advance that "
+                             "cannot be read; refusing rather than give every "
+                             "batch batch 0's bias")
+            return {
+                "kind": "strided2d",
+                "bias_batch_axis": None if _badv[0] == "none" else _badv[0],
+                "bias_batch_stride": _badv[1],
+                "acc_id": acc_id,
+                "alpha": alpha_name2,
+                "beta": beta_name2,
+                "bias_ptr": bias_ptr2.name,
+                "bias_elem": bias_ptr2.elem_type,
+                "bias_row_stride": strided[0],
+                "bias_col_stride": strided[1],
+                "store_id": store.id,
+            }
         bias_ptr = self._trace_ptr_source(cur.operand_ids[0], by_id)
         if bias_ptr is None:
             return _bail("bias pointer does not trace to an argument")
@@ -2028,6 +2062,7 @@ class _DetectionMixin:
             return _bail("alpha/beta are not scalar kernel arguments")
 
         return {
+            "kind": "col",
             "acc_id": acc_id,
             "alpha": alpha_name,
             "beta": beta_name,
@@ -2057,6 +2092,204 @@ class _DetectionMixin:
                 for rid in (o.result_ids or []):
                     out.add(rid)
         return out
+
+
+
+    def _bias_batch_advance(self, bias_name):
+        """``(pid_axis, stride_arg)`` for ``bias_ptr += pid_b * bias_batch_stride``.
+
+        Returns ``("none", None)`` when the bias base carries no
+        program-id-dependent advance at all, and ``None`` when it carries one
+        this cannot read — the caller must then refuse rather than emit an
+        address without it, because a bias read without its batch term gives
+        every batch batch 0's bias: finite, plausible, and wrong.
+        """
+        op_by_id = {}
+
+        def _collect(ops):
+            for o in ops:
+                op_by_id[o.id] = o
+                if o.region_ops:
+                    _collect(o.region_ops)
+                if o.else_ops:
+                    _collect(o.else_ops)
+
+        _collect(self.graph.ops)
+        scalar_arg = {a.id: a.name for a in self.graph.args
+                      if not getattr(a, "is_ptr", False)}
+
+        def _pid_axis(sid, depth=0):
+            o = op_by_id.get(sid)
+            if o is None or depth > 8:
+                return None
+            if o.op in ("tt.get_program_id", "tt.program_id"):
+                try:
+                    return int(o.attrs.get("axis"))
+                except (TypeError, ValueError):
+                    return None
+            if o.op in ("arith.extsi", "arith.trunci", "ttg.convert_layout"):
+                return _pid_axis((o.operand_ids or [None])[0], depth + 1)
+            return None
+
+        def _depends_on_pid(sid, depth=0, seen=None):
+            if seen is None:
+                seen = set()
+            if sid in seen or depth > 12:
+                return False
+            seen.add(sid)
+            o = op_by_id.get(sid)
+            if o is None:
+                return False
+            if o.op in ("tt.get_program_id", "tt.program_id", "tt.get_num_programs"):
+                return True
+            return any(_depends_on_pid(x, depth + 1, seen) for x in (o.operand_ids or []))
+
+        found = None
+        for o in op_by_id.values():
+            if o.op != "tt.addptr" or len(o.operand_ids or []) < 2:
+                continue
+            base = self._trace_ptr_source(o.operand_ids[0], op_by_id)
+            if base is None or base.name != bias_name:
+                continue
+            if not _depends_on_pid(o.operand_ids[1]):
+                continue  # loop-invariant address term, not a batch advance
+            _off_op = op_by_id.get(o.operand_ids[1])
+            _off_ty = getattr(_off_op, "type_str", "") or ""
+            if getattr(_off_op, "is_tensor", False) or "tensor<" in _off_ty:
+                # The 2-D row+col tile offset. It depends on the program id too
+                # (through the tile index), so "depends on pid" alone does not
+                # separate it from a batch advance — the batch advance is the
+                # SCALAR one, exactly as _refuse_batched_matmul_base_offset
+                # already distinguishes them.
+                continue
+            mul = op_by_id.get(o.operand_ids[1])
+            if mul is None or mul.op != "arith.muli" or len(mul.operand_ids or []) != 2:
+                return None
+            axis = stride = None
+            for j in (0, 1):
+                ax = _pid_axis(mul.operand_ids[j])
+                if ax is not None:
+                    axis = ax
+                    stride = scalar_arg.get(mul.operand_ids[1 - j])
+            if axis is None or stride is None:
+                return None
+            if found is not None and found != (axis, stride):
+                return None  # more than one distinct advance: not readable
+            found = (axis, stride)
+        return found if found is not None else ("none", None)
+
+    def _read_2d_bias_strides(self, load_op, by_id):
+        """``(row_stride_arg, col_stride_arg)`` for a 2-D strided bias load.
+
+        Matches ``bias + offs_m[:, None] * ms + offs_n[None, :] * ns``: an
+        ``addptr`` whose offset is the sum of two ``muli`` terms, each a
+        splat scalar argument times an ``expand_dims``-ed range. The
+        ``expand_dims`` AXIS says which is which — ``[:, None]`` expands on
+        axis 1 (the row term), ``[None, :]`` on axis 0 (the column term) —
+        so the two are never swapped by position.
+
+        Returns ``None`` unless both terms resolve to scalar kernel
+        arguments, which keeps every other bias shape on the refusal.
+        """
+        def _peel(o):
+            hops = 0
+            while o is not None and o.op in ("tt.broadcast", "ttg.convert_layout",
+                                             "tt.reshape") and o.operand_ids and hops < 8:
+                o = by_id.get(o.operand_ids[0])
+                hops += 1
+            return o
+
+        # Triton lowers ``bias + m_term + n_term`` as a CHAIN of tt.addptr, not
+        # one addptr over an addi, so collect every offset along the chain
+        # (and split an addi offset when it does appear).
+        ptr = _peel(by_id.get(load_op.operand_ids[0]) if load_op.operand_ids else None)
+        offsets = []
+        hops = 0
+        while ptr is not None and ptr.op == "tt.addptr" and len(ptr.operand_ids or []) >= 2 and hops < 8:
+            offsets.append(ptr.operand_ids[1])
+            ptr = _peel(by_id.get(ptr.operand_ids[0]))
+            hops += 1
+        if not offsets:
+            return None
+
+        _scalar_arg = {a.id: a.name for a in self.graph.args
+                       if not getattr(a, "is_ptr", False)}
+
+        def _axis_of(o):
+            hops = 0
+            while o is not None and hops < 8:
+                if o.op == "tt.expand_dims":
+                    return str(o.attrs.get("axis"))
+                if o.operand_ids:
+                    o = by_id.get(o.operand_ids[0])
+                    hops += 1
+                    continue
+                return None
+            return None
+
+        def _term(vid):
+            """(axis, stride) for one offset term.
+
+            The usual form is ``splat(stride_arg) * expand_dims(range)``. A
+            stride whose value is 1 does NOT appear: Triton specializes an
+            argument equal to 1 and folds the multiply away, leaving the bare
+            ``expand_dims(range)``. The compiled kernel is keyed on that
+            specialization, so emitting the literal 1 is exact, not an
+            assumption.
+            """
+            t = _peel(by_id.get(vid))
+            if t is None:
+                return None
+            if t.op != "arith.muli" or len(t.operand_ids or []) != 2:
+                ax = _axis_of(t)
+                return (ax, "1") if ax is not None else None
+            stride_name = None
+            other = None
+            for j in (0, 1):
+                sp = _peel(by_id.get(t.operand_ids[j]))
+                if sp is not None and sp.op == "tt.splat" and sp.operand_ids:
+                    nm = _scalar_arg.get(sp.operand_ids[0])
+                    if nm is not None:
+                        stride_name = nm
+                        other = by_id.get(t.operand_ids[1 - j])
+            if stride_name is None or other is None:
+                return None
+            axis = None
+            hops2 = 0
+            while other is not None and hops2 < 8:
+                if other.op == "tt.expand_dims":
+                    axis = str(other.attrs.get("axis"))
+                    break
+                if other.operand_ids:
+                    other = by_id.get(other.operand_ids[0])
+                    hops2 += 1
+                    continue
+                break
+            if axis is None:
+                return None
+            return axis, stride_name
+
+        # Flatten any addi offset into its two addends.
+        flat = []
+        for oid in offsets:
+            o = _peel(by_id.get(oid))
+            if o is not None and o.op == "arith.addi" and len(o.operand_ids or []) == 2:
+                flat.extend(o.operand_ids)
+            else:
+                flat.append(oid)
+
+        terms = [_term(v) for v in flat]
+        terms = [t for t in terms if t is not None]
+        by_axis = {}
+        for ax, nm in terms:
+            if ax in by_axis and by_axis[ax] != nm:
+                return None  # two different strides on the same axis: unreadable
+            by_axis[ax] = nm
+        # axis 1 == [:, None] == the ROW term; axis 0 == [None, :] == the COLUMN term.
+        if "1" not in by_axis or "0" not in by_axis:
+            return None
+        return by_axis["1"], by_axis["0"]
+
 
     def _detect_matmul_epilogue(self):
         """Detect matmul -> pointwise/broadcast epilogue -> store (#158).

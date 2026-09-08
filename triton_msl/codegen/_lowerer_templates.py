@@ -305,7 +305,16 @@ class _TemplateMixin:
                 m = triton_type_to_msl(arg.elem_type)
                 arg_decls.append(f"    device {m}* {arg.name} [[buffer({i})]]")
             else:
-                arg_decls.append(f"    device int* {arg.name}_buf [[buffer({i})]]")
+                # A scalar argument is declared with ITS OWN type, not int. A
+                # matmul only needs integer dims and strides, so this was int
+                # everywhere and nothing noticed — until a fused epilogue read
+                # `alpha` and `beta`, which are fp32: declared int, the float
+                # bit pattern was reinterpreted as an integer and the epilogue
+                # scaled the accumulator by garbage (baddbmm, ULP 30686 against
+                # CUDA's 1).
+                arg_decls.append(
+                    f"    device {triton_type_to_msl(arg.elem_type)}* "
+                    f"{arg.name}_buf [[buffer({i})]]")
         lines.append(",\n".join(arg_decls) + ",")
         if has_pid:
             self._used_pid_axes = {0, 1}
@@ -322,7 +331,8 @@ class _TemplateMixin:
             lines.append(") {")
             lines.append("    uint pid_m = 0u, pid_n = 0u;")
         for arg in all_scalar_args:
-            lines.append(f"    int {arg.name} = {arg.name}_buf[0];")
+            lines.append(f"    {triton_type_to_msl(arg.elem_type)} {arg.name} = "
+                         f"{arg.name}_buf[0];")
         if _flat_grid is not None:
             # After the scalar reads, because a flat grid needs N to split the
             # id into tile coordinates.
@@ -377,7 +387,43 @@ class _TemplateMixin:
         lines.append(f"            _sum += (float){a_name}[{_b_off['A']} + m * {a_rs} + k * {a_cs}]")
         lines.append(f"                  * (float){b_name}[{_b_off['B']} + k * {b_rs} + n * {b_cs}];")
         lines.append("        }")
-        lines.append(f"        {c_name}[{_b_off['C']} + m * {c_rs} + n * {c_cs}] = ({c_msl})_sum;")
+        # Fused epilogue (C = alpha*(A@B) + beta*bias). This template has both
+        # `m` and `n` in scope at the store, so it can index any bias shape the
+        # detector reads: a column bias, or a fully strided 2-D bias whose row
+        # and column strides are runtime arguments (legitimately 0 for a
+        # broadcast operand — which is how one expression covers a row bias, a
+        # column bias and a full tile).
+        _epi = getattr(self, "_k_loop_epilogue", None)
+        _val = "_sum"
+        if _epi is not None:
+            if _epi["kind"] == "col":
+                _bias_idx = "n"
+            elif _epi["kind"] == "strided2d":
+                _bb = "0u"
+                if _epi.get("bias_batch_axis") is not None:
+                    if not _batch:
+                        from triton_msl.errors import MetalNonRecoverableError
+
+                        raise MetalNonRecoverableError(
+                            "the bias carries a batch advance but the operands "
+                            "do not: refusing rather than read one batch's bias "
+                            "for every batch.",
+                            op_name="tt.dot",
+                        )
+                    _bb = f"_batch * (uint){_epi['bias_batch_stride']}"
+                _bias_idx = (f"{_bb} + m * (uint){_epi['bias_row_stride']}"
+                             f" + n * (uint){_epi['bias_col_stride']}")
+            else:
+                from triton_msl.errors import MetalNonRecoverableError
+
+                raise MetalNonRecoverableError(
+                    f"unrecognised fused epilogue kind {_epi['kind']!r}; "
+                    f"refusing rather than store the raw accumulator.",
+                    op_name="tt.dot",
+                )
+            _val = (f"({_epi['alpha']} * _sum + {_epi['beta']} * "
+                    f"(float){_epi['bias_ptr']}[{_bias_idx}])")
+        lines.append(f"        {c_name}[{_b_off['C']} + m * {c_rs} + n * {c_cs}] = ({c_msl}){_val};")
         lines.append("    }")
         lines.append("}")
         return "\n".join(lines)
@@ -696,6 +742,19 @@ class _TemplateMixin:
         # store the bare dot — the exact silent-wrong the epilogue refusal
         # existed to prevent. The staged path applies it per element.
         _epi = getattr(self, "_k_loop_epilogue", None)
+        if _epi is not None and _epi.get("kind") != "col":
+            # This template indexes the bias by the output COLUMN only. Any
+            # other shape must not be silently dropped here — refuse, and let
+            # a template that can address it take the kernel.
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                f"a fused {_epi.get('kind')!r} bias epilogue cannot be emitted "
+                f"by the simdgroup K-loop template, which addresses the bias by "
+                f"output column only. Refusing rather than store the raw "
+                f"accumulator.",
+                op_name="tt.dot",
+            )
 
         BLOCK_M = info["BLOCK_M"]
         BLOCK_N = info["BLOCK_N"]
