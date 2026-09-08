@@ -776,6 +776,17 @@ class _ReduceScanMixin:
                         )
                 # else float: identity preserved from above
                 self.kb.raw_line(f"    {acc_msl_type} {acc_var} = {identity};")
+                # A float SUM folded over the wrap loop carries the same
+                # Neumaier compensation the in-kernel reduce carries. Without
+                # it this accumulator is the one uncompensated float sum left
+                # in the engine, and it is the widest one: it runs over the
+                # whole tile, so a tl.sum over 2048+ elements was further from
+                # the oracle than the compensated scan of the SAME tile — the
+                # two disagreed at the block seam of a multi-part cumsum by
+                # more than a correctly-rounded result may.
+                if combine_op == "sum" and acc_msl_type in ("float", "half"):
+                    acc_comp_var = f"{acc_var}_comp"
+                    self.kb.raw_line(f"    {acc_msl_type} {acc_comp_var} = 0;")
 
             # Open the per-element loop
             self._needs_wrapping = True
@@ -795,7 +806,15 @@ class _ReduceScanMixin:
                 input_var = self._lookup(reduce_input_id)
                 # Cast input to accumulator type to avoid Metal ambiguity
                 cast_input = f"({acc_msl_type}){input_var}"
-                if combine_op == "sum":
+                if combine_op == "sum" and acc_msl_type in ("float", "half"):
+                    _t = self._next_var("acc_t")
+                    self.kb.raw_line(f"        {acc_msl_type} {_t} = {acc_var} + {cast_input};")
+                    self.kb.raw_line(
+                        f"        {acc_var}_comp += (fabs({acc_var}) >= fabs({cast_input})) "
+                        f"? (({acc_var} - {_t}) + {cast_input}) "
+                        f": (({cast_input} - {_t}) + {acc_var});")
+                    self.kb.raw_line(f"        {acc_var} = {_t};")
+                elif combine_op == "sum":
                     self.kb.raw_line(f"        {acc_var} += {cast_input};")
                 elif combine_op == "prod":
                     self.kb.raw_line(f"        {acc_var} *= {cast_input};")
@@ -820,6 +839,8 @@ class _ReduceScanMixin:
 
             # Close the loop
             self.kb.raw_line(f"    }}")
+            if next_reduce and acc_var and combine_op == "sum" and acc_msl_type in ("float", "half"):
+                self.kb.raw_line(f"    {acc_var} = {acc_var} + {acc_var}_comp;")
             self._needs_wrapping = False
 
             # Emit any scalar terminal write (atomic/store of a reduce result)
