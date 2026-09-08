@@ -1207,14 +1207,34 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # does per-thread dot product.
         simple_dot = self._detect_simple_dot()
         if simple_dot:
-            return self._lower_simple_dot_inline(simple_dot)
+            try:
+                return self._lower_simple_dot_inline(simple_dot)
+            except MetalNonRecoverableError:
+                # "This TEMPLATE cannot lower it" is not "nothing can". A
+                # matmul carrying a restricting store mask is a shape the
+                # templates model badly by construction — a convolution's A
+                # operand is an im2col GATHER and its output a 4-D address,
+                # neither of which a 2-D tile model expresses — while the
+                # generic per-element lowering below emits the kernel's own
+                # addressing and its own mask, op by op. Fall through for that
+                # case only; every other refusal still propagates.
+                if not getattr(self, "_template_store_mask_needed", False):
+                    raise
 
         # Check for tt.dot — switch to prebuilt matmul template
         if self._requires_matmul_template():
-            msl = self._lower_dot_via_prebuilt_template()
-            # Matmul template needs block_m * block_n threads (typically 1024)
-            self.effective_block_size = self._matmul_block_size
-            return msl
+            try:
+                msl = self._lower_dot_via_prebuilt_template()
+            except MetalNonRecoverableError:
+                # Same rule as the simple-dot path above: a masked matmul that
+                # this template cannot serve goes to the generic per-element
+                # lowering, which emits the kernel's own addressing and mask.
+                if not getattr(self, "_template_store_mask_needed", False):
+                    raise
+            else:
+                # Matmul template needs block_m * block_n threads (typically 1024)
+                self.effective_block_size = self._matmul_block_size
+                return msl
 
         # Check for tl.flip's reshape+xor-reduce pattern — emit direct flip.
         # Must run before _detect_3d_reduce, since the single-step flip case
