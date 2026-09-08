@@ -1249,10 +1249,22 @@ class _DetectionMixin:
         # _has_unhandled_matmul_compute_epilogue. (_detect_matmul_epilogue already
         # claimed the non-looped single-dot case the template CAN emit.)
         if self._has_unhandled_matmul_compute_epilogue():
-            from triton_msl.codegen.generic_lowerer import _MATMUL_EPILOGUE_REFUSE_MSG
-            from triton_msl.errors import MetalNonRecoverableError
+            # One shape of epilogue IS emittable on the K-loop template: an
+            # affine scale plus a per-output-feature COLUMN bias,
+            # ``C = alpha * (A @ B) + beta * bias[col]``, which is what addmm
+            # and baddbmm compile to. Every element of a column takes the same
+            # bias, so a per-simdgroup output strip needs nothing from another
+            # strip — the same argument by which the non-looped fused template
+            # already treats a column bias as safe. Claim it; everything else
+            # (row bias, full 2-D accumulator, arbitrary chains) still refuses.
+            _epi = self._detect_k_loop_affine_col_bias_epilogue()
+            if _epi is not None:
+                self._k_loop_epilogue = _epi
+            else:
+                from triton_msl.codegen.generic_lowerer import _MATMUL_EPILOGUE_REFUSE_MSG
+                from triton_msl.errors import MetalNonRecoverableError
 
-            raise MetalNonRecoverableError(_MATMUL_EPILOGUE_REFUSE_MSG, op_name="tt.dot")
+                raise MetalNonRecoverableError(_MATMUL_EPILOGUE_REFUSE_MSG, op_name="tt.dot")
 
         # BLOCKER 4: refuse a batched matmul (program_id-derived batch offset on an
         # A/B/C base pointer) for BOTH the K-loop and non-K-loop branches, BEFORE either
@@ -1844,6 +1856,207 @@ class _DetectionMixin:
             "tt.clampf",
         }
     )
+
+    def _detect_k_loop_affine_col_bias_epilogue(self):
+        """Detect ``C = alpha * (A @ B) + beta * bias[col]`` on a K-LOOP matmul.
+
+        This is the shape `addmm` / `baddbmm` compile to: the dot accumulates
+        inside an ``scf.for`` over K, and the trailing epilogue scales the
+        accumulator and adds a per-output-feature (column) bias:
+
+            acc = zeros(BLOCK_M, BLOCK_N)
+            for k in ...: acc = tl.dot(a, b, acc)
+            bias = tl.load(bias_ptr + offs_cn, mask=offs_cn < N)
+            c = alpha * acc + beta * bias
+
+        ``_detect_matmul_epilogue`` cannot claim it: that path matches only a
+        TOP-LEVEL ``tt.dot`` and bakes M/N/K as compile-time constants, while
+        here the dot is inside the loop and M/N/K are runtime scalars. So the
+        kernel fell to the epilogue refusal, which is honest but total — the
+        matmul templates store the RAW accumulator and would silently drop the
+        epilogue, so refusing was the only safe option available.
+
+        A COLUMN bias is the case the non-looped fused template already treats
+        as safe ("strip-independent, verified correct"): every element of a
+        column takes the same bias, so a per-simdgroup output strip needs no
+        cross-strip information. The row-bias and full-2-D-accumulator cases
+        are NOT matched here and keep refusing.
+
+        Returns ``{"acc_id", "alpha_id", "beta_id", "bias_ptr", "store_id"}``
+        or ``None``. ``None`` means the existing refusal stands: this only ever
+        claims kernels that are refused today, so it cannot change one that
+        already works.
+        """
+        by_id = {ssa.id: ssa for ssa in self.graph.ops}
+
+        # Exactly one dot, and it must live inside a region (the K-loop).
+        dots = []
+
+        def _find_dots(ops):
+            for o in ops:
+                if o.op == "tt.dot":
+                    dots.append(o)
+                if o.region_ops:
+                    _find_dots(o.region_ops)
+                if o.else_ops:
+                    _find_dots(o.else_ops)
+
+        _find_dots(self.graph.ops)
+        if len(dots) != 1:
+            return None
+        if any(o.op == "tt.dot" for o in self.graph.ops):
+            return None  # top-level dot: _detect_matmul_epilogue's business
+
+        def _peel(vid, ops):
+            """Follow value-preserving wrappers back to the producing op."""
+            seen = 0
+            cur = by_id.get(vid)
+            while cur is not None and cur.op in ops and cur.operand_ids and seen < 8:
+                cur = by_id.get(cur.operand_ids[0])
+                seen += 1
+            return cur
+
+        # `tt.broadcast` lifts the (1, N) bias row to the (M, N) tile; peeling it
+        # is what lets the bias addend be recognised as a scaled value.
+        _WRAP = {"ttg.convert_layout", "tt.reshape", "tt.broadcast"}
+
+        # The single top-level store carries the epilogue result.
+        stores = [o for o in self.graph.ops if o.op == "tt.store"]
+        if len(stores) != 1 or len(stores[0].operand_ids or []) < 2:
+            return None
+        store = stores[0]
+
+        add = _peel(store.operand_ids[1], _WRAP | {"arith.truncf", "tt.fp_to_fp"})
+        if add is None or add.op != "arith.addf" or len(add.operand_ids or []) != 2:
+            return None
+
+        # One side is alpha * acc, the other beta * bias broadcast over rows.
+        def _split_mul(vid):
+            m = _peel(vid, _WRAP)
+            if m is None or m.op != "arith.mulf" or len(m.operand_ids or []) != 2:
+                return None
+            return m
+
+        def _splat_scalar(vid):
+            sp = _peel(vid, _WRAP)
+            if sp is None or sp.op != "tt.splat" or not sp.operand_ids:
+                return None
+            return sp.operand_ids[0]
+
+        import os as _dbg
+        _trace = bool(_dbg.environ.get("TMSL_DEBUG_EPILOGUE"))
+
+        def _bail(why):
+            if _trace:
+                print(f"  [epilogue detector] bail: {why}", flush=True)
+            return None
+
+        acc_ids = self._k_loop_acc_ids()
+        if not acc_ids:
+            return _bail("no k-loop accumulator ids")
+
+        def _as_scaled_acc(mul):
+            """(scalar_id, acc_id) if `mul` is splat(scalar) * k-loop-acc."""
+            for j in (0, 1):
+                sc = _splat_scalar(mul.operand_ids[j])
+                other = mul.operand_ids[1 - j]
+                if sc is not None and other in acc_ids:
+                    return sc, other
+            return None
+
+        def _as_scaled_other(mul):
+            """(scalar_id, other_id) if `mul` is splat(scalar) * anything."""
+            for j in (0, 1):
+                sc = _splat_scalar(mul.operand_ids[j])
+                if sc is not None:
+                    return sc, mul.operand_ids[1 - j]
+            return None
+
+        m0 = _split_mul(add.operand_ids[0])
+        m1 = _split_mul(add.operand_ids[1])
+        if m0 is None or m1 is None:
+            return _bail(f"addends are not both muls ({m0 and m0.op}, {m1 and m1.op})")
+
+        pairing = None
+        for acc_mul, bias_mul in ((m0, m1), (m1, m0)):
+            sa = _as_scaled_acc(acc_mul)
+            if sa is not None:
+                pairing = (sa, bias_mul)
+                break
+        if pairing is None:
+            return _bail(f"neither addend is splat(alpha) * k-loop acc; "
+                         f"acc_ids={len(acc_ids)}")
+        (alpha_id, acc_id), bias_mul = pairing
+
+        sb = _as_scaled_other(bias_mul)
+        if sb is None:
+            return _bail("bias addend is not splat(beta) * value")
+        beta_id, bias_chain = sb
+
+        cur = by_id.get(bias_chain)
+        axis = None
+        for _ in range(8):
+            if cur is None:
+                return _bail("bias chain ran off the graph")
+            if cur.op in ("tt.broadcast", "ttg.convert_layout", "tt.reshape",
+                          "arith.extf", "tt.fp_to_fp"):
+                cur = by_id.get(cur.operand_ids[0]) if cur.operand_ids else None
+                continue
+            if cur.op == "tt.expand_dims":
+                axis = str(cur.attrs.get("axis"))
+                cur = by_id.get(cur.operand_ids[0]) if cur.operand_ids else None
+                continue
+            break
+        # axis 0 == a (1, N) row broadcast down the rows == a COLUMN bias.
+        if cur is None or cur.op != "tt.load":
+            return _bail(f"bias is not a load (got {cur and cur.op})")
+        if axis != "0":
+            return _bail(f"bias broadcast axis is {axis!r}, not a column bias")
+        bias_ptr = self._trace_ptr_source(cur.operand_ids[0], by_id)
+        if bias_ptr is None:
+            return _bail("bias pointer does not trace to an argument")
+
+        # alpha / beta must be plain SCALAR KERNEL ARGUMENTS: the template
+        # emits them by name into the store expression, so a computed value
+        # (which would live in a variable the template never declares) is not
+        # usable and keeps the refusal.
+        _arg_name = {a.id: a.name for a in self.graph.args
+                     if not getattr(a, "is_ptr", False)}
+        alpha_name = _arg_name.get(alpha_id)
+        beta_name = _arg_name.get(beta_id)
+        if alpha_name is None or beta_name is None:
+            return _bail("alpha/beta are not scalar kernel arguments")
+
+        return {
+            "acc_id": acc_id,
+            "alpha": alpha_name,
+            "beta": beta_name,
+            "bias_ptr": bias_ptr.name,
+            "bias_elem": bias_ptr.elem_type,
+            "store_id": store.id,
+        }
+
+    def _k_loop_acc_ids(self):
+        """Ids that carry a K-loop accumulator: every result of a top-level
+        ``scf.for`` whose region holds the single ``tt.dot``."""
+        out = set()
+        for o in self.graph.ops:
+            if o.op != "scf.for" or not o.region_ops:
+                continue
+
+            def _has_dot(ops):
+                for x in ops:
+                    if x.op == "tt.dot":
+                        return True
+                    if x.region_ops and _has_dot(x.region_ops):
+                        return True
+                return False
+
+            if _has_dot(o.region_ops):
+                out.add(o.id)
+                for rid in (o.result_ids or []):
+                    out.add(rid)
+        return out
 
     def _detect_matmul_epilogue(self):
         """Detect matmul -> pointwise/broadcast epilogue -> store (#158).

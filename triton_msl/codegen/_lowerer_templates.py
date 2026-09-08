@@ -23,7 +23,8 @@ from triton_msl.codegen.msl_types import triton_type_to_msl
 from triton_msl.codegen._lowerer_helpers import _mlir_to_triton_dtype
 
 
-def _emit_masked_staged_store(lines, *, acc, scratch, gr, gc, cond, dst, out_type, store_pfx="", indent="    "):
+def _emit_masked_staged_store(lines, *, acc, scratch, gr, gc, cond, dst, out_type,
+                              store_pfx="", indent="    ", value=None):
     """Emit the masked, per-simdgroup staged store of ONE float8x8 accumulator.
 
     simdgroup_store can't mask, so each simdgroup stages its 8x8 into its OWN
@@ -32,6 +33,11 @@ def _emit_masked_staged_store(lines, *, acc, scratch, gr, gc, cond, dst, out_typ
     the caller must declare) write only the in-bounds elements with a cast to
     ``out_type``. The caller supplies the per-site index math (``gr``/``gc``), the
     bounds ``cond``, the ``dst`` lvalue, and an optional ``store_pfx`` column guard.
+
+    ``value`` optionally replaces the raw staged read with an expression over
+    it — the fused epilogue's ``alpha * acc + beta * bias[gc]``. It may use
+    ``gr`` / ``gc``, which are in scope, and defaults to the raw read so every
+    existing caller is unchanged.
 
     SINGLE SOURCE OF TRUTH for the staging mechanism: it previously existed as two
     near-identical copies (the simple-dot and K-loop dot epilogues), and a fix
@@ -44,7 +50,8 @@ def _emit_masked_staged_store(lines, *, acc, scratch, gr, gc, cond, dst, out_typ
     lines.append(f"{indent}threadgroup_barrier(mem_flags::mem_threadgroup);")
     lines.append(f"{indent}for (uint i = laneid; i < 64u; i += 32u) {{")
     lines.append(f"{indent}    uint gr = {gr}, gc = {gc};")
-    lines.append(f"{indent}    if ({cond}) {{ {dst} = {out_type}({scratch}[sgitg * 64u + i]); }}")
+    _v = value or f"{scratch}[sgitg * 64u + i]"
+    lines.append(f"{indent}    if ({cond}) {{ {dst} = {out_type}({_v}); }}")
     lines.append(f"{indent}}}")
     lines.append(f"{indent}threadgroup_barrier(mem_flags::mem_threadgroup);")
 
@@ -680,6 +687,16 @@ class _TemplateMixin:
         stride is a runtime arg != the matrix dim (BLOCKER 1). When None (legacy /
         un-traced) the template falls back to the matrix dims (dense row-major).
         """
+        # Fused affine column-bias epilogue (C = alpha*(A@B) + beta*bias[col]),
+        # claimed by _detect_k_loop_affine_col_bias_epilogue. Every path that
+        # writes C must apply it, so the two paths that write the raw
+        # accumulator are DISABLED while it is present: the unmasked direct
+        # fast path below, and the #159 two-kernel split whose standalone
+        # kernel the launcher would dispatch for aligned shapes. Both would
+        # store the bare dot — the exact silent-wrong the epilogue refusal
+        # existed to prevent. The staged path applies it per element.
+        _epi = getattr(self, "_k_loop_epilogue", None)
+
         BLOCK_M = info["BLOCK_M"]
         BLOCK_N = info["BLOCK_N"]
         BLOCK_K = info["BLOCK_K"]
@@ -915,7 +932,7 @@ class _TemplateMixin:
         # register-blocking above it brings the same to real @triton.jit
         # matmuls. Partial/edge tiles (and half output) fall through to the
         # boundary-safe staged path below — direct simdgroup_load can't mask.
-        if output_msl_type == "float":
+        if output_msl_type == "float" and _epi is None:
             lines.append(f"    if (row_base + {BLOCK_M}u <= _M && col_base + {BLOCK_N}u <= _N && (_K % 8u) == 0u) {{")
             lines.append(f"        for (uint k = 0u; k < _K; k += 8u) {{")
             for c in range(col_tiles):
@@ -1007,6 +1024,12 @@ class _TemplateMixin:
                 # store + write are per-simdgroup guarded; the barriers are NOT
                 # (every thread must reach them, regardless of which columns its
                 # simdgroup owns).
+                _epi_value = None
+                if _epi is not None:
+                    _epi_value = (
+                        f"({_epi['alpha']} * tg_st[sgitg * 64u + i]"
+                        f" + {_epi['beta']} * (float){_epi['bias_ptr']}[gc])"
+                    )
                 _emit_masked_staged_store(
                     lines,
                     acc=acc_names[t][c],
@@ -1018,6 +1041,7 @@ class _TemplateMixin:
                     out_type=output_msl_type,
                     store_pfx=spfx,
                     indent="    ",
+                    value=_epi_value,
                 )
 
         lines.append(f"}}")
@@ -1033,6 +1057,7 @@ class _TemplateMixin:
         _argnames = [a.name for a in self.graph.args]
         if (
             output_msl_type == "float"
+            and _epi is None
             and has_M
             and has_N
             and has_K

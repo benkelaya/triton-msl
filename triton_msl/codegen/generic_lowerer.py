@@ -338,6 +338,10 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # _lower_dot_simple_template when an eligible matmul is detected;
         # read by emit_msl into metadata. None for every other kernel.
         self._fast_matmul = None
+        # Affine column-bias epilogue claimed for a K-loop matmul, set by
+        # detection and read by the template. Initialised here so it can
+        # never leak from one kernel into the next.
+        self._k_loop_epilogue = None
         # FlashAttention zero-copy-dispatch descriptor. Set in the simdgroup-FA
         # branch of _lower_flash_attention_template; read by emit_msl into
         # metadata. Routes the 2-D-grid FA kernel through compile_shader (its
