@@ -12,7 +12,7 @@ None and the generic path is used instead.
 
 import re
 
-from triton_msl.codegen.mlir_walker import SSAValue, _extract_shape
+from triton_msl.codegen.mlir_walker import SSAValue, _extract_shape, iter_ops_recursive
 
 from triton_msl.codegen._lowerer_helpers import _mlir_to_triton_dtype
 
@@ -3176,11 +3176,17 @@ class _DetectionMixin:
         summed to M, not 1). When the stride is constant the row length is constexpr and
         the template cannot represent it; the caller declines to the generic lowering.
         """
-        by_id = {s.id: s for s in self.graph.ops}
-        pid_ids = {s.id for s in self.graph.ops if "program_id" in s.op}
+        # RECURSIVE on all three scans: `graph.ops` is top-level only, and a
+        # program_id (or the multiply that carries the row stride) inside an
+        # scf region is still part of the kernel. Missing it makes this
+        # predicate answer False — "no constexpr stride" — and the caller then
+        # uses the template where it should have declined.
+        _all = list(iter_ops_recursive(self.graph.ops))
+        by_id = {s.id: s for s in _all}
+        pid_ids = {s.id for s in _all if "program_id" in s.op}
         if not pid_ids:
             return False
-        for o in self.graph.ops:
+        for o in _all:
             if o.op in ("arith.muli", "arith.mul") and o.operand_ids and len(o.operand_ids) >= 2:
                 if any(x in pid_ids for x in o.operand_ids):
                     # the operand that is NOT the program_id is the row stride

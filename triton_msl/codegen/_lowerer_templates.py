@@ -16,7 +16,7 @@ parameters.
 
 import re
 
-from triton_msl.codegen.mlir_walker import _extract_shape
+from triton_msl.codegen.mlir_walker import _extract_shape, iter_ops_recursive
 from triton_msl.codegen.msl_emitter import _msl_compute_type, _sanitize_msl_name
 from triton_msl.codegen.msl_types import triton_type_to_msl
 
@@ -86,7 +86,12 @@ class _TemplateMixin:
         decomposition below is used rather than reproducing the kernel's
         swizzle, which only affects locality.
         """
-        axes = {s.attrs.get("axis", 0) for s in self.graph.ops
+        # RECURSIVE: `graph.ops` is top-level only, and a program_id read
+        # inside an scf.if / scf.for region is still a program_id the kernel
+        # reads. Scanning the entry block alone classified such a kernel as
+        # flat and gave every program column tile 0.
+        axes = {s.attrs.get("axis", 0)
+                for s in iter_ops_recursive(self.graph.ops)
                 if s.op == "tt.get_program_id"}
         # A BATCH axis is not a tile axis. A batched matmul reads
         # program_id(2) for the batch and still puts BOTH tile coordinates on
@@ -218,7 +223,10 @@ class _TemplateMixin:
         block size). De-duplicated from three copies after the re-audit
         (2026-06-27) found the fused matmul+softmax twin was the one copy MISSING
         this guard -> multi-block silent-wrong."""
-        pid_axes = {s.attrs.get("axis", 0) for s in self.graph.ops if s.op == "tt.get_program_id"}
+        # RECURSIVE for the same reason as the grid-convention scan above.
+        pid_axes = {s.attrs.get("axis", 0)
+                    for s in iter_ops_recursive(self.graph.ops)
+                    if s.op == "tt.get_program_id"}
         if (1 in pid_axes and not has_N) or (0 in pid_axes and not has_M):
             from triton_msl.errors import MetalNonRecoverableError
 
@@ -284,7 +292,8 @@ class _TemplateMixin:
         has_M = "M" in scalar_arg_map
         has_N = "N" in scalar_arg_map
         has_K = "K" in scalar_arg_map
-        has_pid = any(s.op == "tt.get_program_id" for s in self.graph.ops)
+        has_pid = any(s.op == "tt.get_program_id"
+                      for s in iter_ops_recursive(self.graph.ops))
         # Shared integrity guard (see _refuse_if_pid_tiles_baked_output).
         self._refuse_if_pid_tiles_baked_output(has_M, has_N, "strided matmul")
 
@@ -2721,7 +2730,8 @@ class _TemplateMixin:
         # absent, refuse rather than emit wrong numbers: emit an UNSUPPORTED
         # stub so emit_msl falls back to the legacy parser / errors clearly.
         scalar_args = [a for a in self.graph.args if not a.is_ptr]
-        has_pid = any(s.op == "tt.get_program_id" for s in self.graph.ops)
+        has_pid = any(s.op == "tt.get_program_id"
+                      for s in iter_ops_recursive(self.graph.ops))
         if has_pid and len(scalar_args) < 3:
             from triton_msl.errors import MetalNonRecoverableError
 
