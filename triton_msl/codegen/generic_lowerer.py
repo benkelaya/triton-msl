@@ -63,6 +63,38 @@ def _op_is_exp(op_name: str) -> bool:
 _fa_bias_supported_by_simd = False
 
 
+def _v_head_dim_of(info):
+    """The attention's OUTPUT width, with one answer for an absent key.
+
+    `v_head_dim` is the V/output width; `head_dim` is the QK contraction
+    width. They differ only for asymmetric attention (MLA / DeepSeek,
+    qk=192 v=128). Symmetric attention has them equal, which is why the
+    detector that builds `info` omits nothing and four of the five readers
+    treat an absent key as "symmetric".
+
+    The fifth did not. `info.get("v_head_dim") != info["head_dim"]` reads a
+    missing key as `None`, and `None != head_dim` is True — so the same
+    absence meant "symmetric" in four places and "asymmetric" in one. Only
+    one producer sets the key today, so nothing in production took the
+    contradictory branch; the upstream suite already builds such a dict
+    (`tests/test_fa_simdgroup_routing.py` has `head_dim` and no
+    `v_head_dim`), and a second producer would have found it.
+
+    A default written five times is five chances to write it differently.
+    """
+    if info is None:
+        raise ValueError("_v_head_dim_of(None): there is no attention here")
+    v = info.get("v_head_dim")
+    if v is not None:
+        return v
+    head_dim = info.get("head_dim")
+    if head_dim is None:
+        raise KeyError(
+            "info carries neither v_head_dim nor head_dim, so the output "
+            "width cannot be established; refusing to assume one")
+    return head_dim
+
+
 def _simd_fa_eligible(info):
     """True if the detected FA can use the simdgroup template: head_dim in {64, 128},
     block 32x32, fp32/fp16, AND contiguous innermost (head-dim) stride for all of
@@ -78,9 +110,7 @@ def _simd_fa_eligible(info):
     BM*head_dim*elem bytes of threadgroup memory, so fp32 head_dim>128 overflows the 32KB
     budget -> head_dim>128 is fp16/bf16-only (192 validated, cap 256)."""
     qk = info.get("head_dim")
-    vd = info.get("v_head_dim")
-    if vd is None:
-        vd = qk
+    vd = _v_head_dim_of(info)
     out_dtype = info.get("out_dtype")
     if vd not in (64, 128):
         return False
@@ -131,7 +161,7 @@ def _fa_small_tile_eligible(info):
     if info is None or info.get("is_mla"):
         return False
     head_dim = info.get("head_dim")
-    v_head_dim = info.get("v_head_dim", head_dim)
+    v_head_dim = _v_head_dim_of(info)
     if v_head_dim != head_dim:
         return False          # asymmetric is simd-only; the tiled template is symmetric
     if info.get("out_dtype") not in ("f32", "f16"):
@@ -1020,7 +1050,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     and info["out_dtype"] in ("f32", "f16")
                 ):
                     # Symmetric hd128 -> template (picks simd if contiguous, else tiled).
-                    if not info.get("is_mla") and info["head_dim"] == 128 and info.get("v_head_dim", 128) == 128:
+                    if (not info.get("is_mla") and info["head_dim"] == 128
+                            and _v_head_dim_of(info) == 128):
                         return self._lower_flash_attention_template(info)
                     # MLA (nope/rope 3-dot): the two QK tensors are separate; route to the
                     # cat-dispatch (concat q_nope|q_rope, k_nope|k_rope -> the validated
@@ -1033,7 +1064,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     # (contiguous, v in {64,128}, fp16 for qk>128); else fall through -> refuse.
                     if (
                         not info.get("is_mla")
-                        and info.get("v_head_dim") != info["head_dim"]
+                        and _v_head_dim_of(info) != info["head_dim"]
                         and _simd_fa_eligible(info)
                     ):
                         return self._lower_flash_attention_template(info)
@@ -5926,7 +5957,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         )
 
         head_dim = info["head_dim"]
-        v_head_dim = info.get("v_head_dim", head_dim)  # != head_dim for asymmetric MLA
+        v_head_dim = _v_head_dim_of(info)  # != head_dim for asymmetric MLA
         block_m = info["block_m"]
         block_n = info["block_n"]
         C1 = "c1"
