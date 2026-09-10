@@ -39,6 +39,26 @@ class SSAValue:
     result_ids: Optional[List[int]] = None  # IDs of ALL results (multi-result ops)
 
 
+def iter_ops_recursive(ops):
+    """Every op in `ops`, including the ones inside regions.
+
+    `IRGraph.ops` holds TOP-LEVEL ops only: the walker collects region
+    bodies separately and hangs them off their parent as `region_ops` /
+    `else_ops`. Any pass that asks a question about "the kernel" — which
+    program-id axes does it read, does it contain a barrier, does it write
+    through a pointer it did not compute — must walk those too, or it
+    answers for the entry block and calls it the kernel.
+
+    A `tt.get_program_id(1)` inside an `scf.if` was invisible to two such
+    scans, and a kernel that really does use a 2-D grid was then emitted
+    with a flat one: every program read column tile 0.
+    """
+    for op in ops or ():
+        yield op
+        yield from iter_ops_recursive(getattr(op, "region_ops", None))
+        yield from iter_ops_recursive(getattr(op, "else_ops", None))
+
+
 @dataclass
 class FuncArg:
     """A function argument (pointer or scalar)."""
