@@ -796,12 +796,29 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     f"must be the same width")
         return wide_scan_refusal(scan, len(scan.operand_ids), numel, 1024)
 
-    def _split_ops_by_reductions(self):
-        """Split ops into phases separated by tt.reduce ops.
+    #: A `tt.dot` whose operands were staged through threadgroup memory is a
+    #: phase boundary for the same reason a reduce is: the staging is a
+    #: cooperative loop over all threads behind a barrier, and a barrier inside
+    #: the per-element wrap loop is undefined. It is recognised by the
+    #: `ttg.local_alloc` that feeds it, not by the dot alone -- an unstaged dot
+    #: is an ordinary in-loop op and splitting on it would break every kernel
+    #: that has one.
+    _STAGED_BOUNDARY = ("ttg.local_alloc",)
 
-        Returns a list of (ops_list, is_reduce) tuples. Reduce ops are
+    def _split_ops_by_reductions(self, ops=None, staged_dot=False):
+        """Split ops into phases separated by boundary ops.
+
+        Returns a list of (ops_list, is_boundary) tuples. Boundary ops are
         isolated in their own single-element phases so they can be emitted
         between per-element loops.
+
+        `ops` defaults to the kernel's top-level op list, which is every
+        existing caller. Passing a region's ops splits THAT body instead --
+        which is what a staged dot inside an scf.for needs, since the wrap
+        loop must sit inside the k-loops rather than around them.
+
+        `staged_dot` adds the staging boundary. It is off by default so this
+        call is byte-identical for every kernel that does not carry one.
         """
         # A scan WIDER than the threadgroup is a phase boundary for the same
         # reason a reduce is: it stages the whole tile through threadgroup
@@ -809,9 +826,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # loop is undefined. It splits only in that regime — a scan that fits
         # one thread per element stays an ordinary in-loop op.
         _boundary_ops = ("tt.reduce", "tt.scan") if getattr(self, "_wide_scan", False) else ("tt.reduce",)
+        if staged_dot:
+            _boundary_ops = _boundary_ops + self._STAGED_BOUNDARY
         phases = []
         current_phase = []
-        for ssa in self.graph.ops:
+        for ssa in (self.graph.ops if ops is None else ops):
             if ssa.op in _boundary_ops:
                 if current_phase:
                     phases.append((current_phase, False))
