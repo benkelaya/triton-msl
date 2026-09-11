@@ -805,6 +805,61 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
     #: that has one.
     _STAGED_BOUNDARY = ("ttg.local_alloc",)
 
+    #: Ops whose lowering emits a threadgroup barrier. `has_barrier_ops` is
+    #: computed from a wider set at the dispatch decision; this is the subset
+    #: a staged dot is allowed to be the ONLY source of.
+    _STAGED_DOT_OPS = ("ttg.local_alloc", "tt.dot", "ttg.local_load")
+
+    def staged_dot_loop_nest(self, all_ops):
+        """The outermost `scf.for` whose body stages a dot, or None.
+
+        Returns the loop op, so the caller has the nest to emit phases inside
+        rather than merely a yes/no.
+
+        This is the ONE shape the nesting can serve: every barrier the kernel
+        needs comes from staging a dot's operands, and every one of them is
+        inside a loop. It returns None the moment a barrier-producing op sits
+        outside that nest -- a top-level reduce or scan needs the multipass
+        wrap it already has, and moving the wrap inside the loops would leave
+        that one uncovered. Answering "yes" for a shape it cannot serve is how
+        a refusal gets lifted into invalid MSL, which is what an earlier
+        attempt at this produced and what makes it worth stating twice.
+        """
+        def _walk(ops):
+            for op in ops:
+                yield op
+                if getattr(op, "region_ops", None):
+                    yield from _walk(op.region_ops)
+                if getattr(op, "else_ops", None):
+                    yield from _walk(op.else_ops)
+
+        nest = None
+        for op in all_ops:
+            if op.op != "scf.for" or not getattr(op, "region_ops", None):
+                continue
+            body = list(_walk(op.region_ops))
+            if any(o.op == "ttg.local_alloc" for o in body) and any(
+                    o.op == "tt.dot" for o in body):
+                nest = op
+                break
+        if nest is None:
+            return None
+
+        # Every barrier-producing op must be inside the nest. `_walk` over the
+        # nest gives the ids that are; anything barrier-producing outside them
+        # disqualifies the shape.
+        inside = {id(o) for o in _walk([nest])}
+        for op in _walk(all_ops):
+            if id(op) in inside:
+                continue
+            if op.op in ("tt.reduce", "tt.scan", "tt.trans", "tt.gather",
+                         "tt.cat", "tt.join", "tt.split", "tt.histogram",
+                         "tt.debug_barrier", "ttg.barrier"):
+                return None
+            if op.op in self._STAGED_DOT_OPS:
+                return None
+        return nest
+
     def _split_ops_by_reductions(self, ops=None, staged_dot=False):
         """Split ops into phases separated by boundary ops.
 

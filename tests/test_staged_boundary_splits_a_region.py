@@ -113,3 +113,73 @@ def test_without_the_flag_the_body_is_one_phase(lowerer):
     assert len(phases) == 1 and not phases[0][1], (
         f"without staged_dot the body must stay one non-boundary phase; "
         f"got {len(phases)}")
+
+
+# ── which shapes the nesting may be attempted on, and which it must decline ─
+
+
+class _Op:
+    """A duck-typed op. The predicate reads four attributes and nothing else,
+    so a fake carries the whole contract and the negative cases need no IR."""
+
+    def __init__(self, op, region_ops=None, else_ops=None):
+        self.op = op
+        self.region_ops = region_ops or []
+        self.else_ops = else_ops or []
+
+
+def _predicate(ops):
+    if not HAS:
+        pytest.skip("triton_msl needed")
+    return GenericLowerer.staged_dot_loop_nest(GenericLowerer, ops)
+
+
+@requires_triton
+def test_the_real_shape_is_recognised(lowerer):
+    """The fixture is the shape this is for; if it is not recognised the
+    whole nesting path is unreachable and every negative case below is
+    vacuously satisfied."""
+    assert lowerer.staged_dot_loop_nest(lowerer.graph.ops) is not None
+
+
+@requires_triton
+def test_a_loop_staging_a_dot_is_recognised():
+    nest = _Op("scf.for", [_Op("tt.load"), _Op("ttg.local_alloc"), _Op("tt.dot")])
+    assert _predicate([nest]) is nest, (
+        "the returned value is the NEST, not a boolean: the caller needs the "
+        "loop to emit phases inside")
+
+
+@requires_triton
+def test_a_loop_without_staging_is_not_the_shape():
+    assert _predicate([_Op("scf.for", [_Op("tt.load"), _Op("tt.dot")])]) is None, (
+        "an unstaged dot in a loop needs no cooperative phase and no barrier; "
+        "taking the nesting path for it would restructure a kernel that is "
+        "already correct")
+
+
+@requires_triton
+def test_a_barrier_outside_the_nest_declines():
+    """The case that turns a refusal into invalid MSL if it is got wrong.
+
+    A top-level reduce needs the multipass wrap it already has. Moving the
+    wrap inside the loops would leave that reduce outside every per-element
+    loop, uncovered -- and it would not announce itself, because the kernel
+    still compiles.
+    """
+    nest = _Op("scf.for", [_Op("ttg.local_alloc"), _Op("tt.dot")])
+    assert _predicate([_Op("tt.reduce"), nest]) is None
+    assert _predicate([nest, _Op("tt.scan")]) is None
+    assert _predicate([nest, _Op("ttg.local_alloc")]) is None, (
+        "staging outside the nest is staging the nesting cannot place")
+
+
+@requires_triton
+def test_staging_nested_two_loops_deep_is_still_found():
+    """The captured shape is three loops deep, not one."""
+    inner = _Op("scf.for", [_Op("ttg.local_alloc"), _Op("tt.dot")])
+    mid = _Op("scf.for", [inner])
+    outer = _Op("scf.for", [mid])
+    assert _predicate([outer]) is outer, (
+        "the OUTERMOST loop of the nest is what the phases must be emitted "
+        "inside; returning the innermost would leave the outer loops wrapped")
