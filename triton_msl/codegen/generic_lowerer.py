@@ -8228,16 +8228,34 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             declared none — never as a substitute for one it did declare."""
             if load_other_id is None:
                 return "0"
-            if load_other_id in self.env_array:
-                # an array-form `other` is per-element; the staged fill reads
-                # one element per `_sa`, and the array is indexed per-thread,
-                # so it cannot be re-indexed here. Refuse rather than guess.
+            # The fill visits elements no thread loaded, so it has no
+            # per-element index to read `other` with. It can therefore only
+            # emit an `other` that is the SAME in every element.
+            #
+            # The first version of this guard asked `load_other_id in
+            # self.env_array`, which is a property of the MEPT lowering and
+            # not of the value: `env_array` is populated only when
+            # `mept_enabled`, so with `TRITON_MSL_MEPT=0` the set is empty by
+            # construction and the guard could never fire -- while this
+            # cooperative fill IS still reached with MEPT off, which is easy to
+            # confirm by running any staged-dot kernel under TRITON_MSL_MEPT=0.
+            # A guard wired to a producer that is not installed on the path it
+            # defends cannot defend it.
+            #
+            # So it asks the lowerer's own uniformity judgement, `_is_splat`,
+            # which `tt.splat`, `arith.constant` and splat-preserving binaries
+            # maintain -- and keeps the array test beside it, because a value
+            # can be both splat-derived and laid out as an array.
+            if load_other_id in self.env_array or load_other_id not in self._is_splat:
                 from triton_msl.errors import MetalNonRecoverableError
                 raise MetalNonRecoverableError(
                     "cooperative staged fill of a masked load whose `other` is "
-                    "a per-element array: the fill visits elements a thread did "
-                    "not load, so the array cannot be re-indexed here. Refusing "
-                    "rather than substitute a different value.",
+                    "not uniform across the tile: the fill visits elements a "
+                    "thread did not load, so a per-element `other` cannot be "
+                    "re-indexed here. Refusing rather than substitute a "
+                    "different value. Serving this needs the fill to carry the "
+                    "visited element's index into `other`, the same index it "
+                    "already computes for the pointer.",
                     op_name="tt.load",
                 )
             return self._lookup(load_other_id)

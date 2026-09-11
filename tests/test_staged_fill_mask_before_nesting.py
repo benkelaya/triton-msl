@@ -247,3 +247,84 @@ def test_a_per_thread_fill_is_not_a_global_read():
     assert _fill_sites(per_thread), "the site is not seen at all"
     assert not _global_fill_sites(per_thread), (
         "a per-thread staging was counted as a global read")
+
+
+# ── the refusal's condition must be about the VALUE, not its registration ──
+
+
+def _other_refusal_condition(src):
+    """The `if` that guards the per-element-`other` refusal, as text.
+
+    Returns None when no refusal is present at all, which the caller must
+    treat as a failure rather than as "nothing to check".
+    """
+    needle = "cooperative staged fill of a masked load whose `other` is "
+    at = src.find(needle)
+    if at < 0:
+        return None
+    # Walk BACKWARDS to the nearest `if`, rather than matching forward across
+    # an unbounded span. A forward regex with `(?:[^\n]*\n)*?` in it matched
+    # an `if not op_name:` two hundred lines earlier and reported that as the
+    # refusal's condition -- reading where the text merely resembles what is
+    # wanted instead of where it actually governs.
+    for line in reversed(src[:at].splitlines()):
+        stripped = line.strip()
+        if stripped.startswith("if ") and stripped.endswith(":"):
+            return stripped[3:-1]
+    return None
+
+
+_ENV_ARRAY_ONLY = (
+    "\n            if load_other_id in self.env_array:\n"
+    "                from triton_msl.errors import MetalNonRecoverableError\n"
+    "                raise MetalNonRecoverableError(\n"
+    '                    "cooperative staged fill of a masked load whose `other` is "\n'
+)
+_WITH_UNIFORMITY = (
+    "\n            if load_other_id in self.env_array or load_other_id not in self._is_splat:\n"
+    "                from triton_msl.errors import MetalNonRecoverableError\n"
+    "                raise MetalNonRecoverableError(\n"
+    '                    "cooperative staged fill of a masked load whose `other` is "\n'
+)
+
+
+def test_the_other_refusal_exists_at_all():
+    src = _source()
+    assert _other_refusal_condition(src) is not None, (
+        "no refusal for a non-uniform `other` was found in the lowerer. Every "
+        "assertion below would then pass over an absent guard.")
+
+
+def test_the_refusal_does_not_hang_on_the_mept_registration_alone():
+    """`env_array` is populated only when `mept_enabled`.
+
+    `TRITON_MSL_MEPT=0` restores the legacy scalar path and leaves `env_array`
+    empty by construction — while the cooperative staged fill is still reached
+    there, which running any staged-dot kernel under TRITON_MSL_MEPT=0 shows. A
+    refusal whose only condition is `in self.env_array` is therefore dead code
+    on the MEPT=0 path, and dead exactly where its own docstring promises to
+    protect. The condition must also ask something about the VALUE.
+    """
+    cond = _other_refusal_condition(_source())
+    assert cond is not None
+    assert "_is_splat" in cond, (
+        f"the refusal's condition is `{cond}`, which reduces to a property of "
+        f"the MEPT lowering. With TRITON_MSL_MEPT=0 it can never be true and "
+        f"the staged fill would substitute this thread's value for elements it "
+        f"never loaded — the silent wrong this file exists to stop.")
+
+
+def test_the_detector_rejects_the_env_array_only_form():
+    """Both directions, on the two forms that actually existed.
+
+    Without this row the assertion above is satisfiable by a detector that
+    answers yes to any text: the first version of this guard WAS the
+    env-array-only form, and it must come back red.
+    """
+    assert _other_refusal_condition(_WITH_UNIFORMITY) is not None
+    assert "_is_splat" in _other_refusal_condition(_WITH_UNIFORMITY)
+    cond = _other_refusal_condition(_ENV_ARRAY_ONLY)
+    assert cond is not None, "the detector must still FIND the older form"
+    assert "_is_splat" not in cond, (
+        "the env-array-only form must be seen as lacking a value test; a "
+        "detector that cannot tell the two apart pins nothing")
