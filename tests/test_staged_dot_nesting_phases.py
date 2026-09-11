@@ -77,6 +77,31 @@ _BARRIER = "threadgroup_barrier"
 FIXTURE = str(Path(__file__).parent / "golden" / "staged_dot_in_nested_loops.ttgir")
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _hermetic_caches(tmp_path_factory):
+    """Compile into caches this test owns.
+
+    A compiled kernel is stashed on disk, and a stash written by an earlier
+    run makes `make_msl` return without calling the lowerer at all -- so the
+    test observes the cache, not the code. That has produced a false zero five
+    times in this work already, twice in an instrument written to stop it, and
+    a test is the last place it may happen: its result must not depend on what
+    a previous run left behind.
+    """
+    import os
+    d = tmp_path_factory.mktemp("caches")
+    keys = {"TRITON_CACHE_DIR": str(d / "triton"),
+            "TRITON_MSL_CACHE_DIR": str(d / "msl")}
+    old = {k: os.environ.get(k) for k in keys}
+    os.environ.update(keys)
+    yield
+    for k, v in old.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+
 def _compile():
     return triton_compile(FIXTURE, target=GPUTarget("metal", "apple-m4", 32))
 

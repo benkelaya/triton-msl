@@ -883,10 +883,14 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         _boundary_ops = ("tt.reduce", "tt.scan") if getattr(self, "_wide_scan", False) else ("tt.reduce",)
         if staged_dot:
             _boundary_ops = _boundary_ops + self._STAGED_BOUNDARY
+        # The staged-dot nest is a boundary by IDENTITY, never by op name: a
+        # kernel can hold several `scf.for` and only the one that stages a dot
+        # may be emitted outside the per-element loop.
+        _nest = getattr(self, "_staged_dot_nest", None)
         phases = []
         current_phase = []
         for ssa in (self.graph.ops if ops is None else ops):
-            if ssa.op in _boundary_ops:
+            if ssa.op in _boundary_ops or (_nest is not None and ssa is _nest):
                 if current_phase:
                     phases.append((current_phase, False))
                 phases.append(([ssa], True))
@@ -7853,12 +7857,19 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         """
         from triton_msl.errors import MetalNonRecoverableError
 
-        def _refuse():
+        def _refuse(saw=None):
+            # A refusal must name WHAT IT SAW, not only what it concluded:
+            # "not structurally resolvable" sends the next reader back through
+            # the whole walk to find out which op stopped it. `saw` carries
+            # that op, and the term-walk's own blocker is appended when it is
+            # the term-walk that failed.
+            _seen = saw or getattr(self, "_staged_fill_blocker", None)
+            _detail = f" Stopped at: {_seen}." if _seen else ""
             raise MetalNonRecoverableError(
                 "masked cooperative store of a tile larger than the "
-                "threadgroup: the per-element mask is not a single "
-                "structurally-resolvable row/col bounds comparison and cannot "
-                "be safely reconstructed. Refusing (correct-or-refuse).",
+                "threadgroup: the per-element mask is not a "
+                "structurally-resolvable bounds comparison and cannot "
+                f"be safely reconstructed.{_detail} Refusing (correct-or-refuse).",
                 op_name="tt.store",
             )
 
@@ -7884,7 +7895,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             expr = " + ".join(out) if out else "0"
             return f"{cast}({expr})" if cast else expr
 
-        def _rebuild(cur, depth=0):
+        def _rebuild(cur, depth=0, axis_dim=None):
             """One mask term, or a conjunction of them.
 
             A real bounds mask is rarely a single comparison. A staged dot
@@ -7903,11 +7914,28 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 _refuse()
             op = op_by_id.get(cur)
             if op is None:
-                _refuse()
+                _refuse(f"operand {cur} has no defining op in this scope")
+            if op.op == "tt.expand_dims" and op.operand_ids:
+                # `(offs < bound)[:, None]` — the comparison happened on the
+                # 1-D range and the axis was added after. The AXIS IS LOAD-
+                # BEARING: `offs_m[:, None] < M` and `offs_m[None, :] < M`
+                # guard different halves of the tile and render identically if
+                # it is dropped. `_staged_fill_terms` already carries it as
+                # `axis_dim`; this walk has to hand it down rather than pass
+                # the op through, which is why `tt.expand_dims` is NOT in the
+                # shape-passthrough list below.
+                axis = int(op.attrs.get("axis", 0))
+                d = 1 - axis
+                if d not in (0, 1):
+                    _refuse(f"`tt.expand_dims` on axis {axis}")
+                if axis_dim is not None and axis_dim != d:
+                    _refuse(f"two `tt.expand_dims` disagree on the axis "
+                            f"({axis_dim} then {d})")
+                return _rebuild(op.operand_ids[0], depth + 1, d)
             if op.op in ("arith.andi", "arith.ori") and len(op.operand_ids) >= 2:
                 joiner = "&&" if op.op == "arith.andi" else "||"
-                left = _rebuild(op.operand_ids[0], depth + 1)
-                right = _rebuild(op.operand_ids[1], depth + 1)
+                left = _rebuild(op.operand_ids[0], depth + 1, axis_dim)
+                right = _rebuild(op.operand_ids[1], depth + 1, axis_dim)
                 return f"({left} {joiner} {right})"
             if op.op == "arith.cmpi":
                 if len(op.operand_ids) < 2:
@@ -7927,14 +7955,18 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 is_unsigned = pred_name in ("ult", "ule", "ugt", "uge") if pred_name else pred_int in (6, 7, 8, 9)
                 is_signed = pred_name in ("slt", "sle", "sgt", "sge") if pred_name else pred_int in (2, 3, 4, 5)
                 cast = "(uint)" if is_unsigned else "(int)" if is_signed else ""
-                lhs = _render(self._staged_fill_terms(op.operand_ids[0], None, None, op_by_id), cast)
-                rhs = _render(self._staged_fill_terms(op.operand_ids[1], None, None, op_by_id), cast)
+                lhs = _render(self._staged_fill_terms(op.operand_ids[0], None, axis_dim, op_by_id), cast)
+                rhs = _render(self._staged_fill_terms(op.operand_ids[1], None, axis_dim, op_by_id), cast)
                 if lhs is None or rhs is None:
-                    _refuse()
+                    _refuse(f"`arith.cmpi` operand not structurally resolvable "
+                            f"({getattr(self, '_staged_fill_blocker', None)})")
                 return f"({lhs} {sym} {rhs})"
             if op.op in ("tt.broadcast", "tt.splat", "arith.extsi", "arith.extui", "arith.trunci") and op.operand_ids:
-                return _rebuild(op.operand_ids[0], depth + 1)
-            _refuse()
+                # Shape-only, axis-preserving: a broadcast replicates along an
+                # existing axis and a splat has none, so the axis fixed above
+                # still holds below.
+                return _rebuild(op.operand_ids[0], depth + 1, axis_dim)
+            _refuse(f"`{op.op}` in the mask chain")
 
         return _rebuild(mask_id)
 
