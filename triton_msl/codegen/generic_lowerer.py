@@ -7772,8 +7772,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         with the SAME structural term-walk used for the staged offset
         (``_staged_fill_terms``: make_range -> _fill_row/_fill_col, block
         constants pass through), then render the comparison.  Anything that is
-        not a single ``arith.cmpi`` over structurally-resolvable operands
-        refuses rather than guess -- the old global-make_range string heuristic
+        not a conjunction of ``arith.cmpi`` over structurally-resolvable
+        operands refuses rather than guess -- the old global-make_range string heuristic
         either dropped the mask entirely (a latent OOB silent-wrong for
         non-block-multiple bounds) or hardcoded ``(_fill_row + r_8) < N_CTX``.
         """
@@ -7810,12 +7810,31 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             expr = " + ".join(out) if out else "0"
             return f"{cast}({expr})" if cast else expr
 
-        # Unwrap pass-through wrappers (broadcast/splat/extension) to the cmpi.
-        cur = mask_id
-        for _ in range(16):
+        def _rebuild(cur, depth=0):
+            """One mask term, or a conjunction of them.
+
+            A real bounds mask is rarely a single comparison. A staged dot
+            operand is guarded by the row bound, the column bound and the
+            k-remainder at once — six `arith.cmpi` joined by `arith.andi` on
+            the shape that this refuses today. Handling only one of them meant
+            the FILL side could not be masked at all, which is why it was
+            emitted unmasked and why the whole path had to refuse instead.
+
+            Correct-or-refuse survives the extension by construction: the only
+            branch that RETURNS a value is the comparison, so anything a
+            conjunction is built from is itself a reconstructed comparison, and
+            everything else still refuses.
+            """
+            if depth > 16:
+                _refuse()
             op = op_by_id.get(cur)
             if op is None:
                 _refuse()
+            if op.op in ("arith.andi", "arith.ori") and len(op.operand_ids) >= 2:
+                joiner = "&&" if op.op == "arith.andi" else "||"
+                left = _rebuild(op.operand_ids[0], depth + 1)
+                right = _rebuild(op.operand_ids[1], depth + 1)
+                return f"({left} {joiner} {right})"
             if op.op == "arith.cmpi":
                 if len(op.operand_ids) < 2:
                     _refuse()
@@ -7840,10 +7859,10 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     _refuse()
                 return f"({lhs} {sym} {rhs})"
             if op.op in ("tt.broadcast", "tt.splat", "arith.extsi", "arith.extui", "arith.trunci") and op.operand_ids:
-                cur = op.operand_ids[0]
-                continue
+                return _rebuild(op.operand_ids[0], depth + 1)
             _refuse()
-        _refuse()
+
+        return _rebuild(mask_id)
 
     # MLIR integer ops this emitter can write directly as MSL, with the
     # operator to use. Division and remainder are the point of it: an im2col
@@ -8155,6 +8174,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # between the load and the local_alloc (e.g. arith.mulf by a scale).
         load_ptr_info = None
         load_addptr_id = None
+        load_mask_id = None      # the load's guard; dropping it reads OOB
+        load_other_id = None     # what the rejected lanes are DECLARED to take
         post_load_ops = []  # (op_type, extra_operand_var) chain, in load order
         cur_id = ssa.operand_ids[0]
         for _depth in range(10):
@@ -8164,6 +8185,24 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             if op.op == "tt.load" and op.operand_ids:
                 load_addptr_id = op.operand_ids[0]
                 load_ptr_info = self.env_is_ptr.get(load_addptr_id)
+                # `tt.load(ptr, mask, other)`. The cooperative fill below took
+                # the pointer and left the mask here, emitting
+                # `shared[_sa] = ptr[addr]` where the in-loop form emits
+                # `mask ? ptr[addr] : 0`. On a boundary tile that reads past
+                # the end of the tensor, and the value reaches the dot.
+                # `tt.load(ptr, mask, other)` — THREE operands. `other` is
+                # resolved the same way `_lower_load` does it for the in-loop
+                # path: the mask is the operand the environment knows as one,
+                # and what follows it is `other`. Selecting on the mask and
+                # writing a hardcoded 0 would give the dot a different tile
+                # than the kernel asked for, silently, wherever `other` is not
+                # zero — the same class as the missing mask, committed while
+                # repairing it.
+                for _oid in op.operand_ids[1:]:
+                    if _oid in self.env_is_mask or self._is_mask(_oid):
+                        load_mask_id = _oid
+                    elif load_mask_id is not None and load_other_id is None:
+                        load_other_id = _oid
                 break
             if op.operand_ids:
                 if len(op.operand_ids) >= 2:
@@ -8171,6 +8210,47 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 cur_id = op.operand_ids[0]
             else:
                 break
+
+        def _fill_guard():
+            """The load's mask as an expression in (_fill_row, _fill_col), or
+            None when the load carried none.
+
+            It REFUSES rather than drop when a mask exists and cannot be
+            reconstructed, because dropping it is exactly the silent
+            out-of-bounds read this path was refusing to emit.
+            """
+            if load_mask_id is None:
+                return None
+            return self._rebuild_staged_fill_mask(load_mask_id, op_by_id, M, N)
+
+        def _fill_other():
+            """The value a rejected lane takes, as MSL. `0` only when the load
+            declared none — never as a substitute for one it did declare."""
+            if load_other_id is None:
+                return "0"
+            if load_other_id in self.env_array:
+                # an array-form `other` is per-element; the staged fill reads
+                # one element per `_sa`, and the array is indexed per-thread,
+                # so it cannot be re-indexed here. Refuse rather than guess.
+                from triton_msl.errors import MetalNonRecoverableError
+                raise MetalNonRecoverableError(
+                    "cooperative staged fill of a masked load whose `other` is "
+                    "a per-element array: the fill visits elements a thread did "
+                    "not load, so the array cannot be re-indexed here. Refusing "
+                    "rather than substitute a different value.",
+                    op_name="tt.load",
+                )
+            return self._lookup(load_other_id)
+
+        def _guarded(expr, guard):
+            """`guard ? expr : other` — the in-loop form, restored to the fill.
+
+            The false branch is the load's DECLARED `other`, not a literal
+            zero. A tile of zeros is indistinguishable from an accumulation
+            that ignores its masked positions, so no result would ever show
+            the difference.
+            """
+            return expr if guard is None else f"({guard} ? ({expr}) : {_fill_other()})"
 
         def _apply_post_load(expr):
             for op_type, other_var in post_load_ops:
@@ -8191,7 +8271,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
                 self.kb.raw_line(f"        uint _fill_row = _sa / {N}u;")
                 self.kb.raw_line(f"        uint _fill_col = _sa % {N}u;")
-                val_expr = _apply_post_load(f"{base_ptr}[{new_offset}]")
+                val_expr = _guarded(_apply_post_load(f"{base_ptr}[{new_offset}]"),
+                                    _fill_guard())
                 self.kb.raw_line(f"        {shared_name}[_sa] = {val_expr};")
                 self.kb.raw_line(f"    }}")
             else:
@@ -8227,12 +8308,15 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
                 self.kb.raw_line(f"        uint _fill_row = _sa / {N}u;")
                 self.kb.raw_line(f"        uint _fill_col = _sa % {N}u;")
-                val_expr = _apply_post_load(f"{base_ptr}[{new_offset}]")
+                val_expr = _guarded(_apply_post_load(f"{base_ptr}[{new_offset}]"),
+                                    _fill_guard())
                 self.kb.raw_line(f"        {shared_name}[_sa] = {val_expr};")
                 self.kb.raw_line(f"    }}")
             else:
                 self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
-                self.kb.raw_line(f"        {shared_name}[_sa] = {src_ptr_name}[_sa];")
+                self.kb.raw_line(
+                    f"        {shared_name}[_sa] = "
+                    f"{_guarded(f'{src_ptr_name}[_sa]', _fill_guard())};")
                 self.kb.raw_line(f"    }}")
         else:
             # Fallback: use the value from the wrapping loop (only correct
