@@ -860,7 +860,15 @@ class _TemplateMixin:
                 arg_msl_type = triton_type_to_msl(arg.elem_type)
                 arg_decls.append(f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
             else:
-                arg_decls.append(f"    device int* {arg.name}_buf [[buffer({i})]]")
+                # A scalar argument is declared with ITS OWN type, not int.
+                # `alpha` and `beta` are fp32; read as int their bit
+                # pattern becomes 1065353216, which is exactly the
+                # billion-fold deviation measured on addmm with a bf16
+                # bias. The repair existed in one of the sites that
+                # declare scalars and not in this one.
+                arg_decls.append(
+                    f"    device {triton_type_to_msl(arg.elem_type)}* "
+                    f"{arg.name}_buf [[buffer({i})]]")
         lines.append(",\n".join(arg_decls) + ",")
         _flat_grid = self._emit_tile_ids_from_source_grid(lines, None)
         lines.append(f"    uint sgitg [[simdgroup_index_in_threadgroup]],")
@@ -869,7 +877,8 @@ class _TemplateMixin:
 
         # Unpack scalar args from buffers
         for arg in all_scalar_args:
-            lines.append(f"    int {arg.name} = {arg.name}_buf[0];")
+            lines.append(f"    {triton_type_to_msl(arg.elem_type)} {arg.name} = "
+                f"{arg.name}_buf[0];")
 
         lines.append(f"")
         self._emit_tile_ids_body(
@@ -1171,7 +1180,8 @@ class _TemplateMixin:
             lines.append(f"    uint tiitg [[thread_index_in_threadgroup]]")
             lines.append(f") {{")
             for arg in all_scalar_args:
-                lines.append(f"    int {arg.name} = {arg.name}_buf[0];")
+                lines.append(f"    {triton_type_to_msl(arg.elem_type)} {arg.name} = "
+                f"{arg.name}_buf[0];")
             lines.append(f"    uint pid_m = pid3.x, pid_n = pid3.y;")
             lines.append(f"    uint _M = (uint)M, _N = (uint)N, _K = (uint)K;")
             lines.append(f"    uint row_base = pid_m * {BLOCK_M}u;")
@@ -1246,7 +1256,15 @@ class _TemplateMixin:
                 arg_msl_type = triton_type_to_msl(arg.elem_type)
                 arg_decls.append(f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
             else:
-                arg_decls.append(f"    device int* {arg.name}_buf [[buffer({i})]]")
+                # A scalar argument is declared with ITS OWN type, not int.
+                # `alpha` and `beta` are fp32; read as int their bit
+                # pattern becomes 1065353216, which is exactly the
+                # billion-fold deviation measured on addmm with a bf16
+                # bias. The repair existed in one of the sites that
+                # declare scalars and not in this one.
+                arg_decls.append(
+                    f"    device {triton_type_to_msl(arg.elem_type)}* "
+                    f"{arg.name}_buf [[buffer({i})]]")
 
         lines = []
         lines.append("#include <metal_stdlib>")
@@ -2349,7 +2367,15 @@ class _TemplateMixin:
                 arg_msl_type = triton_type_to_msl(arg.elem_type)
                 arg_decls.append(f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
             else:
-                arg_decls.append(f"    device int* {arg.name}_buf [[buffer({i})]]")
+                # A scalar argument is declared with ITS OWN type, not int.
+                # `alpha` and `beta` are fp32; read as int their bit
+                # pattern becomes 1065353216, which is exactly the
+                # billion-fold deviation measured on addmm with a bf16
+                # bias. The repair existed in one of the sites that
+                # declare scalars and not in this one.
+                arg_decls.append(
+                    f"    device {triton_type_to_msl(arg.elem_type)}* "
+                    f"{arg.name}_buf [[buffer({i})]]")
 
         x_name = ptr_args[0].name if ptr_args else "X"
         z_name = ptr_args[1].name if len(ptr_args) > 1 else "Z"
@@ -2469,7 +2495,15 @@ class _TemplateMixin:
                 arg_msl_type = triton_type_to_msl(arg.elem_type)
                 arg_decls.append(f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
             else:
-                arg_decls.append(f"    device int* {arg.name}_buf [[buffer({i})]]")
+                # A scalar argument is declared with ITS OWN type, not int.
+                # `alpha` and `beta` are fp32; read as int their bit
+                # pattern becomes 1065353216, which is exactly the
+                # billion-fold deviation measured on addmm with a bf16
+                # bias. The repair existed in one of the sites that
+                # declare scalars and not in this one.
+                arg_decls.append(
+                    f"    device {triton_type_to_msl(arg.elem_type)}* "
+                    f"{arg.name}_buf [[buffer({i})]]")
 
         x_name = ptr_args[0].name if ptr_args else "X"
         z_name = ptr_args[1].name if len(ptr_args) > 1 else "Z"
