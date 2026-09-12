@@ -215,6 +215,77 @@ def _extract_layout_signature(type_str):
 # ---------------------------------------------------------------------------
 
 
+#: Bytes per element of the threadgroup types the emitter declares. Counting
+#: ELEMENTS instead of bytes passes a kernel that does not fit and refuses one
+#: that does, so the table is explicit rather than assumed to be four.
+_TG_ELEM_BYTES = {
+    "float": 4, "int": 4, "uint": 4,
+    "half": 2, "short": 2, "ushort": 2, "bfloat": 2,
+    "char": 1, "uchar": 1, "bool": 1,
+}
+
+_TG_DECL = re.compile(
+    r"^\s*threadgroup\s+(" + "|".join(_TG_ELEM_BYTES) + r")\s+(\w+)\[(\d+)\];",
+    re.M)
+
+
+def threadgroup_declarations(msl: str):
+    """(name, dtype, count, bytes) for every threadgroup array declared."""
+    out = []
+    for dtype, name, count in _TG_DECL.findall(msl):
+        n = int(count)
+        out.append((name, dtype, n, n * _TG_ELEM_BYTES[dtype]))
+    return out
+
+
+def threadgroup_bytes_used(msl: str) -> int:
+    """Total threadgroup memory the emitted kernel declares.
+
+    Measured on the FINAL text, after `_alias_shared_memory` has merged what
+    it can: the question is what the driver will be asked for, and aliasing
+    changes that answer.
+    """
+    return sum(b for _, _, _, b in threadgroup_declarations(msl))
+
+
+def refuse_over_threadgroup_budget(msl: str, budget: int | None = None) -> None:
+    """Raise when the kernel asks for more threadgroup memory than it may have.
+
+    This is the same fact the driver reports at pipeline creation, moved to the
+    layer where it can be acted on. At the driver it ends the run; here it is a
+    `MetalNonRecoverableError`, which the autotune sweep already excludes --
+    scoring that config `inf` and trying the next. It also stops the cost being
+    paid first: reaching the driver means the config was lowered, emitted,
+    compiled by `xcrun metal` and linked, all thrown away for a total that can
+    be counted from the text.
+
+    Measured 2026-09-12: hat-s-x4 and swin2SR both reached further into their
+    model once a refused config stopped ending the sweep, and then died on
+    49152 bytes against 32768.
+
+    The refusal names the buffers, not only the total: `49152` alone sends the
+    next reader to the MSL by hand, and which array is oversized is the whole
+    question.
+    """
+    from triton_msl.codegen._lowerer_reduce import metal_threadgroup_bytes
+    from triton_msl.errors import MetalNonRecoverableError
+
+    cap = metal_threadgroup_bytes() if budget is None else budget
+    decls = threadgroup_declarations(msl)
+    total = sum(b for _, _, _, b in decls)
+    if total <= cap:
+        return
+    parts = ", ".join(f"{name}[{n}] {dtype} = {b}B"
+                      for name, dtype, n, b in sorted(decls, key=lambda d: -d[3]))
+    raise MetalNonRecoverableError(
+        f"threadgroup memory: this kernel declares {total} bytes and the "
+        f"device allows {cap}. Buffers, largest first: {parts}. Refusing at "
+        f"codegen rather than at pipeline creation, where the same fact ends "
+        f"the run instead of excluding one autotune config.",
+        op_name="ttg.local_alloc",
+    )
+
+
 def _alias_shared_memory(msl: str) -> str:
     """Rewrite threadgroup array declarations to reuse memory.
 

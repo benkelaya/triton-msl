@@ -39,6 +39,7 @@ from triton_msl.codegen._lowerer_helpers import (
     _shape_numel,
     _extract_layout_signature,
     _alias_shared_memory,
+    refuse_over_threadgroup_budget,
 )
 from triton_msl.codegen._device_func_lowerer import _DeviceFuncLowerer
 from triton_msl.codegen._lowerer_templates import _TemplateMixin
@@ -2199,6 +2200,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
 
         msl = self.kb.build()
         msl = _alias_shared_memory(msl)
+        # Counted on the FINAL text, after aliasing: the question is what the
+        # driver will be asked for, and aliasing changes that answer. Refusing
+        # here rather than at pipeline creation makes it one excluded autotune
+        # config instead of a dead run, and saves lowering, emitting,
+        # `xcrun metal` and linking a kernel that cannot be instantiated.
+        refuse_over_threadgroup_budget(msl)
 
         # Safety net: the generic op-by-op path must never silently emit a
         # kernel with an *empty body* when the graph clearly has a
