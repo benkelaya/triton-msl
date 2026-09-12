@@ -265,3 +265,53 @@ def runner():
     if not _has_metal() or not _has_metal_compiler():
         pytest.skip("Requires Metal GPU and compiler")
     return MetalKernelRunner()
+
+
+# ── the compilation cache belongs to the session, or the session stops ─────
+#
+# Every layer of this stack caches compiled artefacts keyed by a hash of the
+# source: triton's own cache, and the MSL stash. A suite that shares those
+# with the machine reads artefacts an earlier run produced -- so a test can
+# pass over code it never compiled, and a test that changed the lowerer can
+# report on the lowerer as it was.
+#
+# It is not hypothetical. Four tests in this tree began reporting that no
+# lowerer was reached at all, because a stash written minutes earlier made
+# `make_msl` return before calling one. The tests were right and the suite was
+# reading the cache.
+#
+# So the caches are the session's, and if they cannot be made the session's,
+# the session does not start. Putting the thing in a state where it cannot do
+# the harm beats measuring afterwards that it did not.
+
+_SHARED_CACHE_ROOTS = (
+    os.path.join(os.path.expanduser("~"), ".triton", "cache"),
+    os.path.join(os.path.expanduser("~"), ".cache", "triton_msl"),
+)
+
+
+def pytest_configure(config):
+    """Give the session its own compilation caches, or refuse to run."""
+    if os.environ.get("TRITON_MSL_TEST_CACHE_IS_MINE") == "1":
+        return                       # an outer harness already owns them
+    root = tempfile.mkdtemp(prefix="triton_msl_test_cache_")
+    wanted = {
+        "TRITON_CACHE_DIR": os.path.join(root, "triton"),
+        "TRITON_MSL_CACHE_DIR": os.path.join(root, "msl"),
+    }
+    for var, path in wanted.items():
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError as exc:
+            raise pytest.UsageError(
+                f"cannot create a private compilation cache at {path}: {exc}. "
+                f"Refusing to run: sharing {var} with the machine lets a test "
+                f"pass over code it never compiled.") from exc
+        os.environ[var] = path
+    for var, path in wanted.items():
+        got = os.environ.get(var)
+        if got != path or any(got.startswith(r) for r in _SHARED_CACHE_ROOTS):
+            raise pytest.UsageError(
+                f"{var} is {got!r} after being set to {path!r}; the session "
+                f"does not own its compilation cache and will not run.")
+    config._triton_msl_cache_root = root
