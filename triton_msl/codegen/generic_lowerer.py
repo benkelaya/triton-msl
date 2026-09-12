@@ -1144,11 +1144,27 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 for _s in _fa_ops:
                     if _dot.id not in (_s.operand_ids or []):
                         continue
-                    if _s.op in ("arith.mulf", "arith.divf", "arith.muli"):
-                        return True
-                    if _s.op in ("arith.addf", "arith.subf", "arith.addi"):
-                        # the operand that is NOT the dot must be a scalar splat (bias);
-                        # a tensor accumulator (acc += dot) is the valid FA form.
+                    if _s.op in ("arith.mulf", "arith.divf", "arith.muli",
+                                 "arith.addf", "arith.subf", "arith.addi"):
+                        # The other operand must be a SCALAR SPLAT for this to be
+                        # the scale/bias this gate is about.
+                        #
+                        # The multiply branch used to return True unconditionally,
+                        # on the reasoning that a multiplication of a dot result is
+                        # "always a scale". It is not. Online-softmax FlashAttention
+                        # rescales its accumulator by a PER-ROW VECTOR every
+                        # iteration -- `acc = acc * exp(m_i - m_ij)[:, None]` -- which
+                        # is a multiply consuming a dot whose other operand is a
+                        # tensor, not a splat. So the gate refused the canonical
+                        # FlashAttention while its own comment claimed "the validated
+                        # FA is unaffected; only a true scale/bias on the scores is".
+                        #
+                        # Measured 2026-09-12 on whisper: two dots, one `arith.mulf`
+                        # consuming a dot, its other operand produced by
+                        # `tt.broadcast` with `_is_scalar_splat` FALSE. The add branch
+                        # already asked this question; the multiply branch now asks
+                        # the same one, which is what the refusal's own text describes
+                        # (`qk = qk * (1/sqrt(d))`, a scalar).
                         _others = [o for o in (_s.operand_ids or []) if o != _dot.id]
                         if any(_is_scalar_splat(o) for o in _others):
                             return True
