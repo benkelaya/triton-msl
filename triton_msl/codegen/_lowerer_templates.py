@@ -327,12 +327,25 @@ class _TemplateMixin:
         lines.append(",\n".join(arg_decls) + ",")
         if has_pid:
             self._used_pid_axes = {0, 1}
-            # Metal requires all thread-index attributes to share a type; use
-            # uint3 for both when multi-axis dispatch is in play.
+            # Metal requires all thread-index attributes to share a type.
+            # The rule was stated here and not obeyed: `pid3` is emitted as
+            # `uint3` OR `uint` depending on the grid, and `_lid3` was emitted
+            # as `uint3` unconditionally -- so a FLAT grid produced `uint`
+            # beside `uint3` and the shader refused to compile with
+            # "expecting input declarations with either all scalar types or
+            # all vector types". Measured on Kokoro's addmm, reachable only
+            # once the screen stopped refusing that key.
+            #
+            # So the two are decided together: the local id takes the shape
+            # the grid id took.
             _flat_grid = self._emit_tile_ids_from_source_grid(lines, None)
-            lines.append("    uint3 _lid3 [[thread_position_in_threadgroup]]")
-            lines.append(") {")
-            lines.append("    uint lid = _lid3.x;")
+            if getattr(self, "_pid3_is_vector", True) or _flat_grid is False:
+                lines.append("    uint3 _lid3 [[thread_position_in_threadgroup]]")
+                lines.append(") {")
+                lines.append("    uint lid = _lid3.x;")
+            else:
+                lines.append("    uint lid [[thread_position_in_threadgroup]]")
+                lines.append(") {")
         else:
             _flat_grid = None
             lines.append("    uint pid [[threadgroup_position_in_grid]],")
