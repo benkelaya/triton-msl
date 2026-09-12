@@ -115,12 +115,23 @@ def _simd_fa_eligible(info):
     out_dtype = info.get("out_dtype")
     if vd not in (64, 128):
         return False
-    if out_dtype not in ("f32", "f16"):
+    # bf16 belongs here and was left out while every layer around it agreed
+    # it belongs: the routing condition lists it, the dtype gate BEHIND the
+    # routing explains in its own words why the template is safe for it (loads
+    # promoted to float, softmax in fp32, one cast on the store), the
+    # small-tile eligibility accepts it -- and this docstring itself discusses
+    # bf16 for head_dim>128. One layer short of the template on every count
+    # but the dtype list, so every bf16 checkpoint fell through to the bf16
+    # refusal. Whisper's eighth wall, and the same class as the gate's mulf
+    # branch: layers disagreeing about one dtype.
+    if out_dtype not in ("f32", "f16", "bf16"):
         return False
-    # QK contraction width: the Q staging is BM*qk*elem bytes of threadgroup memory. The
-    # 32KB budget caps qk at 192 for fp16 (qk=256 overflows by 384B) and 128 for fp32
-    # (2x the bytes). MLA's qk=192 fits fp16; symmetric hd128 fits both.
-    qk_cap = 192 if out_dtype == "f16" else 128
+    # QK contraction width: the Q staging is BM*qk*elem bytes of threadgroup
+    # memory, so the cap follows the ELEMENT SIZE and not the dtype's name.
+    # The 32KB budget caps qk at 192 for the two-byte types (fp16/bf16;
+    # qk=256 overflows by 384B) and 128 for fp32 (2x the bytes). MLA's qk=192
+    # fits the two-byte types; symmetric hd128 fits all three.
+    qk_cap = 192 if out_dtype in ("f16", "bf16") else 128
     if not (isinstance(qk, int) and qk % 8 == 0 and 64 <= qk <= qk_cap):
         return False
     if not (info.get("block_m") == 32 and info.get("block_n") == 32):
@@ -1285,6 +1296,23 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # asking whether a template could take it refused the models
             # themselves.
             if _fa_has_bf16:
+                if os.environ.get("NBX_NAME_THE_FA_ROUTE"):
+                    # MEASUREMENT ONLY. The refusal says "head_dim, tile, or an
+                    # unresolved parameter" without naming which; three walls
+                    # today have needed the same probe for the same silence.
+                    import sys as _s
+                    try:
+                        _why = self._detect_flash_attention()
+                        _why_txt = {k: _why.get(k) for k in
+                                    ("block_m", "block_n", "head_dim",
+                                     "out_dtype")} if _why else None
+                        _elig = _simd_fa_eligible(_why) if _why else None
+                        _small = _fa_small_tile_eligible(_why) if _why else None
+                    except Exception as _e:
+                        _why_txt, _elig, _small = f"DETECT REFUSED: {str(_e)[:120]}", None, None
+                    print(f"[FA_ROUTE] maxdim={_fa_maxdim} info={_why_txt} "
+                          f"simd_eligible={_elig} small_tile={_small}",
+                          file=_s.stderr, flush=True)
                 raise MetalNonRecoverableError(
                     "FlashAttention with bf16 dot operands reached the generic "
                     "attention lowering, which computes in the operand's own "
