@@ -53,7 +53,7 @@ def _innermost_loop(ops):
 
 
 @pytest.fixture(scope="module")
-def lowerer():
+def lowerer(fresh_compilation_cache):
     """The lowerer instance that refused, with its parsed graph.
 
     Taken from the real compilation rather than rebuilt: a graph assembled by

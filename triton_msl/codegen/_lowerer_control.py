@@ -26,6 +26,15 @@ from triton_msl.codegen.msl_types import triton_type_to_msl
 from triton_msl.codegen._lowerer_helpers import _mlir_to_triton_dtype
 
 
+def _ops_everywhere(ops):
+    for op in ops:
+        yield op
+        if getattr(op, "region_ops", None):
+            yield from _ops_everywhere(op.region_ops)
+        if getattr(op, "else_ops", None):
+            yield from _ops_everywhere(op.else_ops)
+
+
 def _static_numel(type_str):
     """Element count from an MLIR type string, or None when it is unknown.
 
@@ -88,6 +97,22 @@ def _region_is_pure_per_element(region_ops):
 
 class _ControlFlowMixin:
     """``scf.*`` and atomic op lowering for ``GenericLowerer``."""
+
+    def _only_consumer(self, loop_op, value_id):
+        """Is `loop_op` the one and only reader of `value_id`?
+
+        Aliasing a loop's accumulator onto the buffer it starts from replaces
+        that buffer's contents with the accumulated result. Sound only when
+        nothing else reads the original -- so this asks, over every op in the
+        kernel including nested regions, whether any op other than this loop
+        names it. An unknown answer is not available: an op list is a fact.
+        """
+        for op in _ops_everywhere(getattr(self.graph, "ops", []) or []):
+            if op is loop_op:
+                continue
+            if value_id in (op.operand_ids or []):
+                return False
+        return True
 
     def _lower_scf_for(self, ssa: SSAValue):
         """scf.for -> MSL for loop with iter_args.
@@ -165,9 +190,6 @@ class _ControlFlowMixin:
                 init_total *= d
             if len(init_shape) >= 2 and init_total > bs:
                 # Allocate persistent shared memory for this iter_arg
-                smem_name = f"smem_iter_{self._shared_counter}"
-                self._shared_counter += 1
-                self.kb.declare_threadgroup_array(smem_name, dtype="fp32", size=init_total)
                 # Cooperative init. When the init value is ITSELF a
                 # shared-memory array — a nested loop whose iter-arg is the
                 # enclosing loop's accumulator, which is what a convolution's
@@ -177,6 +199,31 @@ class _ControlFlowMixin:
                 # scalar. The YIELD side already copies element-wise when it
                 # sees a different source array; the INIT side did not.
                 _src_smem = (getattr(self, "_shared_mem_descs", {}) or {}).get(init_id)
+                # ALIAS rather than copy, when nothing else reads the value
+                # this loop starts from. Three nested K-loops each allocating
+                # their own copy of one accumulator is 24 KB of threadgroup
+                # memory for a single tile -- measured on a convolution, which
+                # then failed to build a pipeline at 36864 bytes against the
+                # 32768 the device allows. The copy is not merely wasteful, it
+                # is what puts the kernel over the limit.
+                #
+                # Sound exactly when this loop is the ONLY consumer of the
+                # incoming value: the accumulator it yields replaces what it
+                # started from, so a reader of the original would see the
+                # accumulated value instead. That is checked over the whole op
+                # list, not assumed from the shape of a reduction nest.
+                if _src_smem is not None and self._only_consumer(ssa, init_id):
+                    smem_name = (_src_smem[0] if isinstance(_src_smem, (tuple, list))
+                                 else _src_smem)
+                    iter_vars.append(smem_name)
+                    iter_dtypes.append(init_type)
+                    smem_iter_indices.add(i)
+                    if not hasattr(self, "_shared_mem_descs"):
+                        self._shared_mem_descs = {}
+                    continue
+                smem_name = f"smem_iter_{self._shared_counter}"
+                self._shared_counter += 1
+                self.kb.declare_threadgroup_array(smem_name, dtype="fp32", size=init_total)
                 self.kb.raw_line(f"    for (uint _si = lid; _si < {init_total}u; _si += {bs}u) {{")
                 if _src_smem is not None:
                     _src_name = _src_smem[0] if isinstance(_src_smem, (tuple, list)) else _src_smem
@@ -613,6 +660,19 @@ class _ControlFlowMixin:
             self.env_types[ssa.id] = iter_dtypes[0] if iter_dtypes else "fp32"
             if init_ids and init_ids[0] in self.env_shapes:
                 self.env_shapes[ssa.id] = self.env_shapes[init_ids[0]]
+            # A single iter_arg collapses `result_ids` to None, so this branch
+            # stands in for the loop above -- and it did not register the
+            # shared-memory descriptor that branch registers. A smem-backed
+            # accumulator then reached its consumers as a BARE ARRAY NAME:
+            # `static_cast<bfloat>(smem_iter_0)`, a cast from
+            # `threadgroup float *`, which is the one error left after the
+            # scope errors were closed. The descriptor is what tells a consumer
+            # the value is a tile in threadgroup memory and must be indexed.
+            if 0 in smem_iter_indices:
+                init_shape = self.env_shapes.get(init_ids[0], ()) if init_ids else ()
+                if not hasattr(self, "_shared_mem_descs"):
+                    self._shared_mem_descs = {}
+                self._shared_mem_descs[ssa.id] = (iter_vars[0], init_shape, "fp32")
             # MEPT register-array iter-arg: a single-result scf.for reports
             # ``result_ids`` as None (mlir_walker collapses len==1), so the
             # result maps to ``ssa.id`` here, not the multi-result loop above.

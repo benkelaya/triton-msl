@@ -674,6 +674,99 @@ class _ReduceScanMixin:
             combine_expr = "acc + val"
         return identity, combine_expr
 
+    def _lower_staged_dot_phase(self, nest, all_preceding_ops, available_ids):
+        """Emit the staged-dot loop nest as a boundary phase.
+
+        The nest is lowered at FUNCTION scope, between the per-element wrap
+        loops of the phases around it, so its cooperative staging is free to
+        run across all threads. That leaves one thing to repair: the per-
+        element index values its body reads were computed inside the previous
+        phase's wrap loop and died with it. Eight `use of undeclared
+        identifier` errors, measured, all of that one kind.
+
+        They are REPLAYED here, at function scope with ``_needs_wrapping``
+        false, so every `tt.make_range` resolves to ``lid`` -- thread `lid`
+        holding element `lid`, which is exactly what the per-thread staging
+        inside the nest then writes to ``smem[lid]``.
+
+        That is sound only while the replayed value is no wider than the
+        threadgroup. A wider one would be half-covered at ``lid`` and nothing
+        would say so, which is why the width is checked rather than assumed:
+        anything wider must reach the fill through the structural address
+        rebuild, which indexes by ``_fill_row``/``_fill_col`` and needs no
+        replay at all.
+        """
+        from triton_msl.errors import MetalNonRecoverableError
+        from triton_msl.codegen._lowerer_control import _static_numel
+
+        # The deps are those of the nest's BODY, not of the `scf.for` itself:
+        # a loop's own operands are its bounds and iter_args, so collecting on
+        # the nest gathered nothing and the eight errors stayed exactly as they
+        # were. What reads the dead values is every op inside the regions.
+        def _body(ops):
+            for op in ops:
+                yield op
+                if getattr(op, "region_ops", None):
+                    yield from _body(op.region_ops)
+                if getattr(op, "else_ops", None):
+                    yield from _body(op.else_ops)
+
+        body_ops = list(_body(nest.region_ops or []))
+        body_ids = {o.id for o in body_ops}
+        replay = [o for o in self._collect_tensor_deps(
+            body_ops, all_preceding_ops, available_ids) if o.id not in body_ids]
+        saved_wrap = self._needs_wrapping
+        self._needs_wrapping = False
+        try:
+            # Uniformity is tracked ACROSS the replay, in dependency order,
+            # because it is a property of the value and not of its type width.
+            # The first version of this guard asked only the width and refused
+            # the shape on an `arith.constant dense<0.0>` 2048 elements wide --
+            # the masked load's `other`, the same value in every element, which
+            # one thread's copy reproduces exactly. Refusing on width alone
+            # would have closed the path on the most ordinary operand there is.
+            uniform = set()
+            for ssa in replay:
+                width = _static_numel(getattr(ssa, "type_str", "") or "")
+                srcs = list(ssa.operand_ids or [])
+                is_uniform = (
+                    ssa.op in ("arith.constant", "tt.splat")
+                    or (bool(srcs) and all(s in uniform for s in srcs))
+                )
+                if is_uniform:
+                    uniform.add(ssa.id)
+                elif width and width > self.effective_block_size:
+                    raise MetalNonRecoverableError(
+                        f"staged dot: a {width}-element value that VARIES "
+                        f"across the tile feeds the loop nest and would be "
+                        f"replayed at one element per thread, covering only "
+                        f"{self.effective_block_size} of it. Refusing rather "
+                        f"than emit a tile that is right in its first "
+                        f"{self.effective_block_size} elements. Serving this "
+                        f"needs the value re-derived from the visited "
+                        f"element's index, as the staged fill does for the "
+                        f"operand address.",
+                        op_name="tt.dot",
+                    )
+                self._lower_op(ssa)
+            self._lower_op(nest)
+        finally:
+            self._needs_wrapping = saved_wrap
+
+        # The nest's loop-carried accumulator lives in threadgroup memory, a
+        # whole tile of it, and the phases after this one read it one element
+        # per thread inside their own wrap loop. Bind it the way a wide scan
+        # binds its staged result -- to `smem[_loop_e]` -- so the epilogue
+        # indexes the tile instead of casting the array itself.
+        for rid in (nest.result_ids or ([nest.id] if nest.id is not None else [])):
+            desc = getattr(self, "_shared_mem_descs", {}).get(rid)
+            if not desc:
+                continue
+            shared, shape, dtype = desc
+            if not hasattr(self, "_wide_scan_bindings"):
+                self._wide_scan_bindings = {}
+            self._wide_scan_bindings[rid] = (f"{shared}[_loop_e]", dtype, shape)
+
     def _lower_multipass_reduction(self, block_size):
         """Emit multi-pass reduction: per-element loops separated by reductions.
 
@@ -729,6 +822,11 @@ class _ReduceScanMixin:
                             reduce_result_ids | arg_ids | lowered_scalar_ids,
                             lowered_scalar_ids,
                         )
+                        all_preceding_ops.append(ssa)
+                    elif ssa is getattr(self, "_staged_dot_nest", None):
+                        self._lower_staged_dot_phase(ssa, all_preceding_ops,
+                                                     reduce_result_ids | arg_ids
+                                                     | lowered_scalar_ids)
                         all_preceding_ops.append(ssa)
                     else:
                         self._lower_op(ssa)

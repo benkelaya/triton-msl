@@ -2042,7 +2042,21 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # unreachable on this branch — all eight models fail at
             # aten.convolution::0 with this message, and all of them have a
             # 2048-element tile.
-            if has_barrier_ops:
+            _nest = self.staged_dot_loop_nest(list(all_ops_iter)) if has_barrier_ops else None
+            if _nest is not None:
+                # THE ONE SERVABLE SHAPE: every barrier this kernel needs comes
+                # from staging a dot's operands, and all of them are inside
+                # this nest. The nest becomes a phase boundary, exactly as a
+                # wide scan does, so the per-element phases around it get their
+                # own wrap loops and the staging runs cooperatively at function
+                # scope. `staged_dot_loop_nest` returns None for every other
+                # reason a kernel has barriers, and the refusal below stands
+                # for those.
+                self._staged_dot_nest = _nest
+                use_multipass = True
+                self._total_elements = block_size
+                block_size = 1024
+            elif has_barrier_ops:
                 # The stated reason used to be barrier divergence, and that
                 # reason is WRONG for the common case. The loop is
                 # `for (_loop_e = lid; _loop_e < total; _loop_e += 1024)`,
@@ -7895,6 +7909,57 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             expr = " + ".join(out) if out else "0"
             return f"{cast}({expr})" if cast else expr
 
+        #: Signed and unsigned division and remainder. MLIR's `divsi`/`remsi`
+        #: truncate toward zero, which is what C++ `/` and `%` do on signed
+        #: ints, so the mapping is direct -- but the SIGNEDNESS must be forced
+        #: on the operands, because C++ promotes a mixed comparison to unsigned
+        #: and `-1 / 4` then stops being `0`.
+        _DIVREM = {"arith.divsi": ("/", "(int)"), "arith.remsi": ("%", "(int)"),
+                   "arith.divui": ("/", "(uint)"), "arith.remui": ("%", "(uint)")}
+
+        def _operand_expr(oid, cast, axis_dim, depth=0):
+            """One comparison operand as an MSL expression in the fill index.
+
+            The additive term walk is tried first and unchanged: it is shared
+            with the staged OFFSET rebuild, and the offset needs coefficients
+            distributed over sums, which is what it is for. What it cannot
+            express is a division -- `bhw / out_width`, the spatial
+            decomposition every convolution guard is written with -- because a
+            quotient is not an additive contribution.
+
+            So the mask walk renders those itself rather than teaching the
+            additive walk a term it does not need. Anything neither can
+            resolve still returns None and still refuses.
+            """
+            rendered = _render(self._staged_fill_terms(oid, None, axis_dim, op_by_id), cast)
+            if rendered is not None:
+                return rendered
+            if depth > 8:
+                return None
+            op = op_by_id.get(oid)
+            if op is None:
+                return None
+            if op.op in ("tt.broadcast", "tt.splat", "arith.extsi",
+                         "arith.extui", "arith.trunci") and op.operand_ids:
+                return _operand_expr(op.operand_ids[0], cast, axis_dim, depth + 1)
+            if op.op == "tt.expand_dims" and op.operand_ids:
+                axis = int(op.attrs.get("axis", 0))
+                d = 1 - axis
+                if d not in (0, 1) or (axis_dim is not None and axis_dim != d):
+                    return None
+                return _operand_expr(op.operand_ids[0], cast, d, depth + 1)
+            entry = _DIVREM.get(op.op)
+            if entry is not None and len(op.operand_ids or []) >= 2:
+                sym, inner = entry
+                a = _operand_expr(op.operand_ids[0], inner, axis_dim, depth + 1)
+                b = _operand_expr(op.operand_ids[1], inner, axis_dim, depth + 1)
+                if a is None or b is None:
+                    return None
+                expr = f"({a} {sym} {b})"
+                return f"{cast}({expr})" if cast else expr
+            self._staged_fill_blocker = op.op
+            return None
+
         def _rebuild(cur, depth=0, axis_dim=None):
             """One mask term, or a conjunction of them.
 
@@ -7955,8 +8020,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 is_unsigned = pred_name in ("ult", "ule", "ugt", "uge") if pred_name else pred_int in (6, 7, 8, 9)
                 is_signed = pred_name in ("slt", "sle", "sgt", "sge") if pred_name else pred_int in (2, 3, 4, 5)
                 cast = "(uint)" if is_unsigned else "(int)" if is_signed else ""
-                lhs = _render(self._staged_fill_terms(op.operand_ids[0], None, axis_dim, op_by_id), cast)
-                rhs = _render(self._staged_fill_terms(op.operand_ids[1], None, axis_dim, op_by_id), cast)
+                lhs = _operand_expr(op.operand_ids[0], cast, axis_dim)
+                rhs = _operand_expr(op.operand_ids[1], cast, axis_dim)
                 if lhs is None or rhs is None:
                     _refuse(f"`arith.cmpi` operand not structurally resolvable "
                             f"({getattr(self, '_staged_fill_blocker', None)})")

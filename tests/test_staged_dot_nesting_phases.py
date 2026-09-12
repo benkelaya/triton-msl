@@ -197,22 +197,31 @@ def test_the_phase_order_detector_sees_a_swap():
 
 
 @requires_triton
-def test_the_nesting_refusal_is_actually_reached_by_this_shape():
+@pytest.mark.usefixtures("fresh_compilation_cache")
+def test_this_shape_takes_the_cooperative_staged_path():
     """Without this, every assertion below passes over a kernel that never
     took the generic path at all — which is what the first version of this
     file did, compiling cleanly through the 128-thread matmul template.
+
+    It keyed on the NESTING REFUSAL while that refusal stood, and stopped
+    controlling anything the moment the refusal was fixed — which is when a
+    control is needed most. It now reads the emitted MSL instead: the
+    cooperative fill loop and the per-element wrap are what this path emits,
+    and no other path emits them, so it holds on both sides of the repair.
     """
-    with pytest.raises(MetalNonRecoverableError) as exc:
-        _compile()
-    assert _NESTING_REFUSAL in str(exc.value), (
-        f"this shape must reach the NESTING refusal, not some other one. "
-        f"Got: {str(exc.value)[:200]}")
+    msl = _compile().asm["msl"]
+    assert _FILL.search(msl), (
+        "no cooperative fill loop in the emitted MSL: this shape was taken by "
+        "some other path, and every assertion below is about a different "
+        "object than the one fifteen models are blocked on")
+    assert _WRAP.search(msl), (
+        "no per-element wrap loop: a tile wider than the threadgroup must be "
+        "covered by one")
+    assert _BARRIER in msl, "no barrier between the fill and the dot"
 
 
 @requires_triton
-@pytest.mark.xfail(strict=True, reason="the nesting is not served yet: the "
-                   "wrap loop is still emitted outside the k-loops. Remove "
-                   "this marker with the fix, not before.")
+@pytest.mark.usefixtures("fresh_compilation_cache")
 def test_no_barrier_is_emitted_inside_the_per_element_wrap():
     msl = _compile().asm["msl"]
     assert not barrier_inside_wrap(msl), (
@@ -220,7 +229,7 @@ def test_no_barrier_is_emitted_inside_the_per_element_wrap():
 
 
 @requires_triton
-@pytest.mark.xfail(strict=True, reason="the nesting is not served yet.")
+@pytest.mark.usefixtures("fresh_compilation_cache")
 def test_the_phases_are_emitted_fill_then_barrier_then_dot():
     msl = _compile().asm["msl"]
     order = phase_order(msl)

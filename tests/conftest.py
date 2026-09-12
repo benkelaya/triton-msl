@@ -315,3 +315,31 @@ def pytest_configure(config):
                 f"{var} is {got!r} after being set to {path!r}; the session "
                 f"does not own its compilation cache and will not run.")
     config._triton_msl_cache_root = root
+
+
+@pytest.fixture(scope="module")
+def fresh_compilation_cache(tmp_path_factory):
+    """A cache no earlier compilation in this session has written to.
+
+    NOT a duplicate of `pytest_configure` above, which gives the SESSION its
+    own caches so a test never reads what the machine left behind. This serves
+    a different property: freshness WITHIN the session. Two modules compiling
+    the same fixture share the session's stash, so the second gets a compiled
+    kernel and never calls the lowerer -- which is fatal for a test that
+    observes the lowerer rather than the result.
+
+    Ask for it in any test that inspects codegen. The distinction is worth the
+    second fixture: one guards against the machine, the other against the run.
+    """
+    d = tmp_path_factory.mktemp("fresh_cache")
+    keys = {"TRITON_CACHE_DIR": str(d / "triton"), "TRITON_MSL_CACHE_DIR": str(d / "msl")}
+    old = {k: os.environ.get(k) for k in keys}
+    for k, v in keys.items():
+        os.makedirs(v, exist_ok=True)
+    os.environ.update(keys)
+    yield d
+    for k, v in old.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
