@@ -1925,22 +1925,6 @@ class MetalBackend(BaseBackend):
             return data
 
         except Exception as e:
-            if os.environ.get("NBX_DUMP_REFUSED_IR"):
-                # A GATED MEASUREMENT FACILITY, kept on purpose. Twice now a refusal
-                # has had to be reproduced from the IR a model actually produces --
-                # the staged dot, then the 2-D reduce family -- because a kernel
-                # written to RESEMBLE the case compiles through a template the real
-                # one never reaches and proves nothing. Dumping at the exact point
-                # the refusal is raised is what makes the fixture the object itself.
-                # Off unless the variable names a directory; costs nothing when off.
-                import pathlib as _p
-                _t = str(mod)
-                _d = _p.Path(os.environ["NBX_DUMP_REFUSED_IR"])
-                _d.mkdir(parents=True, exist_ok=True)
-                _f = _d / f"{kernel_name}_{hashlib.sha1(_t.encode()).hexdigest()[:8]}.ttgir"
-                _f.write_text(_t)
-                _f.with_suffix(".why").write_text(str(e))
-                print(f"[DUMP] {_f.name}  {len(_t)} caracteres", flush=True)
             mode = _fallback_mode()
             if mode == "warn":
                 warnings.warn(
@@ -2125,6 +2109,22 @@ class MetalBackend(BaseBackend):
         try:
             msl_src = emit_msl(mod, metadata, options)
         except Exception as e:
+            if os.environ.get("NBX_DUMP_REFUSED_IR"):
+                # A GATED MEASUREMENT FACILITY, kept on purpose. Twice now a refusal
+                # has had to be reproduced from the IR a model actually produces --
+                # the staged dot, then the 2-D reduce family -- because a kernel
+                # written to RESEMBLE the case compiles through a template the real
+                # one never reaches and proves nothing. Dumping at the exact point
+                # the refusal is raised is what makes the fixture the object itself.
+                # Off unless the variable names a directory; costs nothing when off.
+                import pathlib as _p
+                _t = str(mod)
+                _d = _p.Path(os.environ["NBX_DUMP_REFUSED_IR"])
+                _d.mkdir(parents=True, exist_ok=True)
+                _f = _d / f"{kernel_name}_{hashlib.sha1(_t.encode()).hexdigest()[:8]}.ttgir"
+                _f.write_text(_t)
+                _f.with_suffix(".why").write_text(str(e))
+                print(f"[DUMP] {_f.name}  {len(_t)} caracteres", flush=True)
             mode = _fallback_mode()
             if mode == "warn":
                 warnings.warn(
